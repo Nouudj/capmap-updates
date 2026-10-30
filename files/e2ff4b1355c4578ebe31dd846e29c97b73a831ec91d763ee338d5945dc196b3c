@@ -1,0 +1,6 @@
+Gesichts- und Körpererkennung in CapMap
+
+MediaPipe Tasks Vision 0.10.35 (vision.js, vision_wasm_internal.*) und die Modelle
+Face Landmarker (face.wasm) und Pose Landmarker Lite (pose.wasm) stammen von Google MediaPipe
+und stehen unter der Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
+Die Modelle sind unverändert, nur umbenannt. Alles läuft auf dem Gerät, es wird nichts hochgeladen.

@@ -1,0 +1,50 @@
+// Speech recognition with whisper.cpp on the graphics card (Vulkan on Windows, Metal on the Mac).
+// Runs as its own process: the native library keeps one model loaded, so a different model means a fresh process,
+// and a crash in a graphics driver cannot take CapMap down.
+const path = require('path');
+let whisper = null, loadErr = '';
+try {
+  const dir = path.join(__dirname, 'native', 'whisper', process.platform + '-' + process.arch);
+  whisper = require(path.join(dir, 'whisper.node')).whisper;
+} catch (e) { loadErr = String(e && e.message || e); }
+
+// Silero VAD (MIT): finds where someone actually speaks, so whisper does not invent sentences in pauses or music
+const fs = require('fs');
+const VAD = path.join(__dirname, 'native', 'whisper', 'ggml-silero-v5.1.2.bin');
+let vadOk = fs.existsSync(VAD);
+const queue = [];
+let busy = false;
+function next() {
+  if (busy || !queue.length) return;
+  busy = true;
+  const { id, pcm, language, model } = queue.shift();
+  const t0 = Date.now();
+  const run = useVad => whisper({
+      model, pcmf32: pcm, language: language || 'auto', detect_language: false,
+      use_gpu: true, flash_attn: false, translate: false, no_prints: true, no_timestamps: false,
+      comma_in_time: false, max_len: 1, audio_ctx: 0,
+      ...(useVad ? { vad: true, vad_model: VAD, vad_threshold: 0.35, vad_speech_pad_ms: 300, vad_min_silence_duration_ms: 400, vad_min_speech_duration_ms: 150 } : {})
+    }, (err, res) => {
+      // if the speech finder fails, run once more without it and leave it off from now on
+      if (err && useVad) { vadOk = false; return run(false); }
+      busy = false;
+      if (err) process.parentPort.postMessage({ id, error: String(err && err.message || err) });
+      else process.parentPort.postMessage({ id, segs: res && res.transcription || [], language: res && res.language || '', ms: Date.now() - t0, vad: useVad });
+      next();
+    });
+  try {
+    run(vadOk);
+  } catch (e) {
+    busy = false;
+    process.parentPort.postMessage({ id, error: String(e && e.message || e) });
+    next();
+  }
+}
+process.parentPort.on('message', e => {
+  const m = e.data || {};
+  if (m.cmd === 'hello') return process.parentPort.postMessage({ id: m.id, ok: !!whisper, error: loadErr });
+  if (m.cmd === 'run') {
+    if (!whisper) return process.parentPort.postMessage({ id: m.id, error: loadErr || 'Spracherkennung nicht geladen' });
+    queue.push(m); next();
+  }
+});

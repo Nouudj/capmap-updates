@@ -1,0 +1,206 @@
+// Speech recognition worker for CapMap. Runs Whisper (tiny = fast, base = accurate, small = most accurate) locally with transformers.js.
+// Large files are published in parts (the host caps single files), so fetch is wrapped to stitch them.
+// Where the parts are missing (the downloadable package), the files come once from a public CDN.
+const BASE = new URL('./', self.location.href).href;
+const MODELS = {
+  tiny:{id:'Xenova/whisper-tiny', npm:'sts-whisper-tiny@1.0.0', parts:{
+    'encoder_model_quantized.onnx':{files:['enc.wasm'], size:10124910},
+    'decoder_model_merged_quantized.onnx':{files:['dec0.wasm', 'dec1.wasm', 'dec2.wasm'], size:30727765}}},
+  base:{id:'Xenova/whisper-base', npm:'sts-whisper-base@1.0.0', parts:{
+    'encoder_model_quantized.onnx':{files:['enc0.wasm', 'enc1.wasm', 'enc2.wasm'], size:23200850},
+    'decoder_model_merged_quantized.onnx':{files:['dec0.wasm', 'dec1.wasm', 'dec2.wasm', 'dec3.wasm', 'dec4.wasm'], size:53707539}}},
+  // "small" is too big to ship inside CapMap: it comes once as the npm package archive (CORS-open registry), is unpacked here and kept in the browser cache
+  small:{id:'Xenova/whisper-small', tgz:['https://registry.npmjs.org/sts-whisper-small/-/sts-whisper-small-1.0.0.tgz'], tgzSize:165623913, parts:{
+    'encoder_model_quantized.onnx':{size:92324809}, 'decoder_model_merged_quantized.onnx':{size:156780950}}},
+};
+const SMALL_CACHE = 'capmap-whisper-small-v1', SMALL_KEY = 'https://capmap.invalid/whisper-small/';
+const SMALL_NEED = ['config.json', 'generation_config.json', 'preprocessor_config.json', 'tokenizer.json', 'tokenizer_config.json', 'added_tokens.json', 'special_tokens_map.json', 'normalizer.json', 'vocab.json', 'merges.txt', 'onnx/encoder_model_quantized.onnx', 'onnx/decoder_model_merged_quantized.onnx'];
+let smallFiles = null, tgzOverride = null;
+// streaming tar reader: calls want(name) -> boolean, returns {name: Uint8Array}
+async function untarPick(reader, want){
+  const td = new TextDecoder(), out = {};
+  let buf = new Uint8Array(0), off = 0;
+  let state = 'head', left = 0, pad = 0, target = null, tpos = 0, meta = null, nextName = null;
+  const cstr = (h, o, l) => { let e = o; while (e < o + l && h[e]) e++; return td.decode(h.subarray(o, e)); };
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (value && value.length) {
+      const rest = buf.subarray(off);
+      if (rest.length) { const nb = new Uint8Array(rest.length + value.length); nb.set(rest); nb.set(value, rest.length); buf = nb; } else buf = value;
+      off = 0;
+    }
+    for (;;) {
+      const avail = buf.length - off;
+      if (state === 'data') {
+        const n = Math.min(left, avail);
+        if (target && n) target.set(buf.subarray(off, off + n), tpos);
+        tpos += n; off += n; left -= n;
+        if (left) break;
+        if (meta) {
+          const txt = td.decode(target);
+          if (meta === 'L') nextName = txt.replace(/\0[\s\S]*$/, '');
+          else { const m = /(?:^|\n)\d+ path=([^\n]*)\n/.exec(txt); if (m) nextName = m[1]; }
+          meta = null;
+        }
+        target = null; state = 'pad'; left = pad;
+      }
+      if (state === 'pad') {
+        const n = Math.min(left, buf.length - off); off += n; left -= n;
+        if (left) break;
+        state = 'head';
+      }
+      if (buf.length - off < 512) break;
+      const h = buf.subarray(off, off + 512); off += 512;
+      let zero = true; for (let k = 0; k < 512; k++) if (h[k]) { zero = false; break; }
+      if (zero) continue;
+      let name = cstr(h, 0, 100); const prefix = cstr(h, 345, 155); if (prefix) name = prefix + '/' + name;
+      if (nextName) { name = nextName; nextName = null; }
+      const size = parseInt(cstr(h, 124, 12).trim() || '0', 8) || 0, type = h[156] ? String.fromCharCode(h[156]) : '0';
+      pad = (512 - size % 512) % 512; tpos = 0; left = size; state = 'data'; meta = null; target = null;
+      if (type === 'L' || type === 'x') { meta = type; target = new Uint8Array(size); }
+      else if (type === '0' && want(name)) target = out[name] = new Uint8Array(size);
+    }
+    if (done) break;
+  }
+  return out;
+}
+async function smallFromCache(){
+  if (!self.caches) return null;
+  try {
+    const c = await caches.open(SMALL_CACHE), out = {};
+    for (const n of SMALL_NEED) { const r = await c.match(SMALL_KEY + n); if (!r) return null; out[n] = new Uint8Array(await r.arrayBuffer()); }
+    return out;
+  } catch (err) { return null; }
+}
+/* stream the .tgz: gunzip with DecompressionStream, walk the tar headers, keep only the model files */
+async function smallFromTgz(){
+  const urls = tgzOverride ? [tgzOverride] : MODELS.small.tgz;
+  let last = null;
+  for (const url of urls) {
+    try {
+      const r = await origFetch(url); if (!r.ok || !r.body) throw new Error('Download fehlgeschlagen (' + r.status + ')');
+      total = +r.headers.get('content-length') || MODELS.small.tgzSize; loaded = 0;
+      const counted = r.body.pipeThrough(new TransformStream({transform(chunk, ctl){ loaded += chunk.length; report(); ctl.enqueue(chunk); }}));
+      const reader = counted.pipeThrough(new DecompressionStream('gzip')).getReader();
+      const pre = 'package/models/Xenova/whisper-small/', got = await untarPick(reader, n => n.startsWith(pre) && SMALL_NEED.includes(n.slice(pre.length)));
+      const out = {}; for (const [n, d] of Object.entries(got)) out[n.slice(pre.length)] = d;
+      for (const n of SMALL_NEED) if (!out[n]) throw new Error('Im Paket fehlt ' + n);
+      if (self.caches) { try { const c = await caches.open(SMALL_CACHE); for (const n of SMALL_NEED) await c.put(SMALL_KEY + n, new Response(out[n])); } catch (err) {} }
+      return out;
+    } catch (err) { last = err; }
+  }
+  throw last || new Error('Download fehlgeschlagen');
+}
+async function loadSmall(){
+  if (smallFiles) return smallFiles;
+  postMessage({type:'status', text:'Sehr genaue Spracherkennung wird geladen'});
+  smallFiles = await smallFromCache();
+  if (!smallFiles) { postMessage({type:'status', text:'Sehr genaue Spracherkennung wird heruntergeladen (einmalig, ca. 166 MB)'}); smallFiles = await smallFromTgz(); }
+  return smallFiles;
+}
+const CDNS = [p => `https://cdn.jsdelivr.net/npm/${p}`, p => `https://unpkg.com/${p}`];
+const WASM = {files:['ort0.wasm', 'ort1.wasm'], size:21596019};
+let loaded = 0, total = 1;
+const origFetch = self.fetch.bind(self);
+
+async function readAll(url, count){
+  const r = await origFetch(url);
+  if (!r.ok) throw new Error('Datei fehlt: ' + url.split('/').pop());
+  if (!r.body || !r.body.getReader) { const b = await r.arrayBuffer(); if (count) { loaded += b.byteLength; report(); } return new Uint8Array(b); }
+  const reader = r.body.getReader(); const chunks = []; let n = 0;
+  for (;;) { const {done, value} = await reader.read(); if (done) break; chunks.push(value); n += value.length; if (count) { loaded += value.length; report(); } }
+  const out = new Uint8Array(n); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+let lastReport = 0;
+function report(){ const now = Date.now(); if (now - lastReport > 120) { lastReport = now; postMessage({type:'progress', loaded, total}); } }
+async function joinParts(dirUrl, files){
+  const bufs = []; for (const f of files) bufs.push(await readAll(dirUrl + f, true));
+  const size = bufs.reduce((a, b) => a + b.length, 0), out = new Uint8Array(size); let o = 0;
+  for (const b of bufs) { out.set(b, o); o += b.length; }
+  return out;
+}
+async function fromCdn(path, count){
+  let last = null;
+  for (const c of CDNS) { try { return await readAll(c(path), count); } catch (err) { last = err; } }
+  throw last || new Error('cdn');
+}
+const localOk = {};
+async function hasLocal(key){
+  if (key in localOk) return localOk[key];
+  try { const r = await origFetch(BASE + 'models/' + MODELS[key].id + '/config.json'); localOk[key] = r.ok; } catch (err) { localOk[key] = false; }
+  return localOk[key];
+}
+self.fetch = async (input, init) => {
+  const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+  const clean = url.split('?')[0];
+  for (const [key, M] of Object.entries(MODELS)) {
+    const pre = BASE + 'models/' + M.id + '/';
+    if (!clean.startsWith(pre)) continue;
+    if (key === 'small') {
+      const rel = clean.slice(pre.length), f = smallFiles && smallFiles[rel];
+      if (!f) return new Response('not found', {status:404});
+      return new Response(f, {status:200, headers:{'Content-Type':rel.endsWith('.json') ? 'application/json' : 'application/octet-stream', 'Content-Length':String(f.length)}});
+    }
+    const rel = clean.slice(pre.length), name = rel.split('/').pop(), p = M.parts[name];
+    const local = await hasLocal(key);
+    let buf;
+    if (local) {
+      if (!p) return origFetch(input, init);
+      buf = await joinParts(pre + 'onnx/', p.files);
+    } else buf = await fromCdn(`${M.npm}/models/${M.id}/${rel}`, !!p);
+    return new Response(buf, {status:200, headers:{'Content-Type':name.endsWith('.json') ? 'application/json' : 'application/octet-stream', 'Content-Length':String(buf.length)}});
+  }
+  return origFetch(input, init);
+};
+
+let tf = null; const pipes = {};
+async function getPipe(key){
+  if (pipes[key]) return pipes[key];
+  if (key === 'small') await loadSmall();
+  postMessage({type:'status', text:key === 'small' ? 'Sehr genaue Spracherkennung wird gestartet' : key === 'base' ? 'Genaue Spracherkennung wird geladen' : 'Spracherkennung wird geladen'});
+  loaded = 0; total = Object.values(MODELS[key].parts).reduce((a, p) => a + p.size, 0);
+  if (!tf) {
+    tf = await import('./transformers.min.js');
+    const env = tf.env;
+    env.allowRemoteModels = false; env.allowLocalModels = true; env.localModelPath = BASE + 'models/'; env.useBrowserCache = false;
+    const wasm = env.backends.onnx.wasm; wasm.numThreads = 1; wasm.proxy = false;
+    // the speech runtime comes from the local folder when it is there, otherwise from the jsDelivr CDN
+    let local = false;
+    try { const r = await origFetch(BASE + WASM.files[0]); local = r.ok; if (r.body && r.body.cancel) r.body.cancel(); } catch (err) { local = false; }
+    if (local) { wasm.wasmPaths = BASE; wasm.wasmBinary = (await joinParts(BASE, WASM.files)).buffer; loaded = 0; }
+  }
+  pipes[key] = await tf.pipeline('automatic-speech-recognition', MODELS[key].id, {dtype:'q8', device:'wasm'});
+  postMessage({type:'progress', loaded:total, total});
+  return pipes[key];
+}
+
+self.onmessage = async e => {
+  const msg = e.data;
+  if (msg.type !== 'run') return;
+  let key = MODELS[msg.model] ? msg.model : 'base';
+  if (msg.tgz) tgzOverride = msg.tgz;
+  try {
+    let p;
+    try { p = await getPipe(key); }
+    catch (err) {
+      console.warn('model', key, err);
+      if (key === 'small') { smallFiles = null; postMessage({type:'fallback', from:'small', to:'base', why:String(err && err.message || err)}); key = 'base'; try { p = await getPipe('base'); } catch (e2) { postMessage({type:'fallback', from:'base', to:'tiny'}); key = 'tiny'; p = await getPipe('tiny'); } }
+      else if (key === 'base') { postMessage({type:'fallback', from:'base', to:'tiny'}); key = 'tiny'; p = await getPipe('tiny'); } else throw err;
+    }
+    const opts = {task:'transcribe', no_repeat_ngram_size:0};
+    if (msg.language) opts.language = msg.language;
+    let out = null, ts = null;
+    // timing per word (cross-attention alignment) when asked, otherwise per phrase, otherwise text only
+    if (msg.ts) {
+      for (const mode of msg.ts === 'word' ? ['word', true] : [true]) {
+        try { out = await p(msg.audio, {...opts, return_timestamps:mode}); ts = mode === 'word' ? 'word' : 'phrase'; break; } catch (err) { console.warn('timestamps', mode, err); out = null; }
+      }
+    }
+    if (!out) out = await p(msg.audio, opts);
+    postMessage({type:'done', id:msg.id, model:key, text:(out && out.text) || '', ts, chunks:ts && out && Array.isArray(out.chunks) ? out.chunks.map(c => ({text:c.text, s:c.timestamp && c.timestamp[0], e:c.timestamp && c.timestamp[1]})) : null});
+  } catch (err) {
+    postMessage({type:'error', id:msg.id, message:String(err && err.message || err)});
+  }
+};
+postMessage({type:'ready'});

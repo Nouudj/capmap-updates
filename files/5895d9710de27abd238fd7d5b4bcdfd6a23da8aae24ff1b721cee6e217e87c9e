@@ -1,0 +1,98 @@
+// CapMap connector for the Claude app (a local MCP server, spoken over stdin/stdout).
+// The Claude app starts it as: CapMap.exe capmap-mcp.js  (with ELECTRON_RUN_AS_NODE=1).
+// It forwards Claude's tool calls to the running CapMap window through a local door
+// (127.0.0.1, secret token in ~/.capmap/bridge.json). If CapMap is closed, it opens it.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const http = require('http');
+const { spawn } = require('child_process');
+
+const BRIDGE_FILE = path.join(os.homedir(), '.capmap', 'bridge.json');
+const STATIC_TOOLS = path.join(__dirname, 'capmap-tools.json');
+const VERSION = '0.9.8.4';
+const INSTRUCTIONS = 'Steuert den Video-Editor CapMap auf diesem Computer (die geöffnete App). Antworte dem Nutzer auf Deutsch. ' +
+  'Lies vor jeder Änderung mit projekt_lesen das Projekt; nimm Clip- und Spur-IDs nur aus den Ergebnissen, gültige IDs für Soundeffekte, Effekte, Übergänge, Vorlagen und LUTs mit liste_anzeigen. ' +
+  'Zeiten sind Sekunden auf der Timeline. Mit vorschau_ansehen siehst du ein Bild des Videos an einer Stelle. Mach genau das Gewünschte; zum Schluss sag kurz, was du geändert hast. ' +
+  'Der Nutzer kann jede Änderung in CapMap mit Strg+Z rückgängig machen. Exportieren macht der Nutzer selbst.';
+
+function send(msg) { process.stdout.write(JSON.stringify(msg) + '\n'); }
+function log(...a) { process.stderr.write('[capmap] ' + a.join(' ') + '\n'); }
+function readBridge() { try { return JSON.parse(fs.readFileSync(BRIDGE_FILE, 'utf8')); } catch (e) { return null; } }
+
+function post(b, url, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body || {});
+    const req = http.request({ host: '127.0.0.1', port: b.port, path: url, method: 'POST', timeout: 30 * 60 * 1000,
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data), 'x-capmap-token': b.token } }, res => {
+      let s = ''; res.setEncoding('utf8');
+      res.on('data', d => { s += d; });
+      res.on('end', () => { if (res.statusCode !== 200) return reject(new Error('CapMap antwortet nicht (' + res.statusCode + ')')); try { resolve(JSON.parse(s)); } catch (e) { reject(new Error('Antwort von CapMap unlesbar')); } });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('Zeitüberschreitung')));
+    req.end(data);
+  });
+}
+function launchCapMap() {
+  const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
+  const args = process.env.CAPMAP_APP_DIR ? [process.env.CAPMAP_APP_DIR] : [];
+  try { spawn(process.execPath, args, { detached: true, stdio: 'ignore', env, windowsHide: false }).unref(); } catch (e) { log('start failed', e.message); }
+}
+async function bridge(url, body, mayLaunch) {
+  const b = readBridge();
+  if (b) { try { return await post(b, url, body); } catch (e) { if (!mayLaunch) throw e; } }
+  if (!mayLaunch) throw new Error('CapMap ist nicht geöffnet.');
+  launchCapMap();
+  const t0 = Date.now();
+  while (Date.now() - t0 < 45000) {
+    await new Promise(r => setTimeout(r, 800));
+    const nb = readBridge();
+    if (nb && (!b || nb.token !== b.token)) { try { await new Promise(r => setTimeout(r, 1500)); return await post(nb, url, body); } catch (e) {} }
+  }
+  throw new Error('CapMap ließ sich nicht starten. Öffne CapMap bitte selbst und versuch es nochmal.');
+}
+function staticTools() { try { return JSON.parse(fs.readFileSync(STATIC_TOOLS, 'utf8')); } catch (e) { return []; } }
+
+async function handle(msg) {
+  const { id, method, params } = msg;
+  if (method === 'initialize') {
+    return { protocolVersion: (params && params.protocolVersion) || '2025-06-18', capabilities: { tools: {} },
+      serverInfo: { name: 'capmap', title: 'CapMap', version: VERSION }, instructions: INSTRUCTIONS };
+  }
+  if (method === 'ping') return {};
+  if (method === 'tools/list') {
+    let tools = null;
+    try { const r = await bridge('/tools', {}, false); if (r && Array.isArray(r.result)) tools = r.result; } catch (e) {}
+    return { tools: tools || staticTools() };
+  }
+  if (method === 'tools/call') {
+    const name = params && params.name, input = (params && params.arguments) || {};
+    try {
+      const r = await bridge('/call', { name, input }, true);
+      if (r.error) return { content: [{ type: 'text', text: r.error }], isError: true };
+      const out = r.result;
+      if (out && out.__image) return { content: [{ type: 'image', data: out.__image, mimeType: 'image/jpeg' }, { type: 'text', text: out.text || 'Vorschaubild' }] };
+      return { content: [{ type: 'text', text: typeof out === 'string' ? out : JSON.stringify(out) }] };
+    } catch (e) { return { content: [{ type: 'text', text: String(e && e.message || e) }], isError: true }; }
+  }
+  if (id !== undefined) throw Object.assign(new Error('Unbekannte Methode ' + method), { code: -32601 });
+  return undefined;
+}
+
+let buf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  buf += chunk;
+  let i;
+  while ((i = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+    if (!line) continue;
+    let msg; try { msg = JSON.parse(line); } catch (e) { send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); continue; }
+    if (msg.id === undefined || msg.id === null) { handle(msg).catch(() => {}); continue; } // notification
+    handle(msg).then(result => send({ jsonrpc: '2.0', id: msg.id, result }),
+      e => send({ jsonrpc: '2.0', id: msg.id, error: { code: e.code || -32603, message: String(e.message || e) } }));
+  }
+});
+process.stdin.on('end', () => process.exit(0));

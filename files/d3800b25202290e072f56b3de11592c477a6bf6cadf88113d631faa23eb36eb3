@@ -1,0 +1,15 @@
+CapMap – Spracherkennung, verwendete Komponenten
+
+whisper.cpp / ggml (MIT) – https://github.com/ggml-org/whisper.cpp
+whisper-node-addon (MIT) – https://github.com/Kutalia/whisper-node-addon
+OpenAI Whisper Modelle tiny / base / large-v3-turbo (MIT) – https://github.com/openai/whisper
+Silero VAD v5.1.2 (MIT) – https://github.com/snakers4/silero-vad
+
+"Deutsch Profi": primeline/whisper-large-v3-turbo-german
+  Lizenz: Apache License 2.0 – https://huggingface.co/primeline/whisper-large-v3-turbo-german
+  ggml-Umwandlung: cstr/whisper-large-v3-turbo-german-ggml (Apache License 2.0)
+  Das Modell wird unverändert verwendet. Lizenztext: https://www.apache.org/licenses/LICENSE-2.0
+
+Flüssige Zeitlupe:
+rife-ncnn-vulkan (MIT) – https://github.com/nihui/rife-ncnn-vulkan
+RIFE v4.6 Modell (MIT) – https://github.com/hzwer/ECCV2022-RIFE

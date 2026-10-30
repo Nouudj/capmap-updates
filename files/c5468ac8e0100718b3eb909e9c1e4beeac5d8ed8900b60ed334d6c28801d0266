@@ -1,0 +1,941 @@
+const { app, BrowserWindow, protocol, net, ipcMain, session, shell, Menu, screen, dialog, utilityProcess, desktopCapturer } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const { spawn } = require('child_process');
+const { pathToFileURL } = require('url');
+const http = require('http');
+const crypto = require('crypto');
+const os = require('os');
+
+// H.265 (HEVC) played by the graphics card: on by default since Electron 22, switched on explicitly so nothing turns it off
+app.commandLine.appendSwitch('enable-features', 'PlatformHEVCDecoderSupport');
+protocol.registerSchemesAsPrivileged([{ scheme: 'capmap', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } }]);
+
+const WEB = path.join(__dirname, 'web');
+// the app's own folder (an update on the Mac lives in the user folder and leaves out the big speech models)
+const BASE = process.env.CAPMAP_BASE_DIR || __dirname, WEB_BASE = path.join(BASE, 'web');
+const FFMPEG = process.env.CAPMAP_FFMPEG || path.join(process.resourcesPath || __dirname, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
+let CONV;
+
+// a second start (e.g. by Claude) only wakes the running CapMap and must not touch anything else,
+// above all not the bridge file, otherwise Claude would talk to a CapMap that has already quit
+if (!app.requestSingleInstanceLock()) { app.exit(0); return; }
+
+function inside(root, rel) {
+  const p = path.normalize(path.join(root, decodeURIComponent(rel)));
+  return p.startsWith(root) ? p : null;
+}
+
+/* ---------- import from a link: direct file links are downloaded by CapMap itself;
+   YouTube and other video sites only through yt-dlp, if the user installed it himself (CapMap does not ship it) ---------- */
+const LINKS = new Map();
+function linkPref() { try { return JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'link.json'), 'utf8')) || {}; } catch (e) { return {}; } }
+function linkPrefSave(o) { try { fs.writeFileSync(path.join(app.getPath('userData'), 'link.json'), JSON.stringify({ ...linkPref(), ...o })); } catch (e) {} }
+function findYtdlp() {
+  const home = os.homedir(), win = process.platform === 'win32', names = win ? ['yt-dlp.exe', 'yt-dlp_x86.exe'] : ['yt-dlp', 'yt-dlp_macos'];
+  const c = [linkPref().ytdlp, process.env.CAPMAP_YTDLP];
+  for (const d of (process.env.PATH || '').split(path.delimiter)) if (d) for (const n of names) c.push(path.join(d, n));
+  if (win) { const la = process.env.LOCALAPPDATA || '', up = process.env.USERPROFILE || home;
+    c.push(path.join(la, 'Microsoft', 'WinGet', 'Links', 'yt-dlp.exe'), path.join(up, 'scoop', 'shims', 'yt-dlp.exe'), path.join(up, 'Downloads', 'yt-dlp.exe'), 'C:\\yt-dlp\\yt-dlp.exe', path.join(process.env.ProgramData || 'C:\\ProgramData', 'chocolatey', 'bin', 'yt-dlp.exe'));
+    // CapMap-YouTube-Addon.zip: "Alle extrahieren" legt den Ordner in Downloads oder auf dem Desktop an (manchmal doppelt verschachtelt)
+    for (const base of [path.join(up, 'Downloads'), path.join(up, 'Desktop'), path.join(up, 'OneDrive', 'Desktop'), path.join(up, 'Documents')]) for (const sub of [['CapMap-YouTube-Addon'], ['CapMap-YouTube-Addon', 'CapMap-YouTube-Addon']]) c.push(path.join(base, ...sub, 'yt-dlp.exe'));
+    try { const py = path.join(la, 'Programs', 'Python'); for (const v of fs.readdirSync(py)) c.push(path.join(py, v, 'Scripts', 'yt-dlp.exe')); } catch (e) {} }
+  else for (const d of ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', path.join(home, '.local', 'bin'), path.join(home, 'Downloads')]) for (const n of names) c.push(path.join(d, n));
+  return c.find(f => f && fs.existsSync(f)) || null;
+}
+const VIDEO_SITES = /(^|\.)(youtube\.com|youtu\.be|tiktok\.com|twitch\.tv|instagram\.com|x\.com|twitter\.com|vimeo\.com|facebook\.com|fb\.watch|reddit\.com|kick\.com|dailymotion\.com|soundcloud\.com)$/i;
+function linkNormalize(u) {
+  let url; try { url = new URL(String(u).trim()); } catch (e) { return null; }
+  if (!/^https?:$/.test(url.protocol)) return null;
+  const h = url.hostname.replace(/^www\./, '');
+  // Google Drive and Dropbox share links → the direct file
+  let m = /\/file\/d\/([\w-]+)/.exec(url.pathname);
+  if (h === 'drive.google.com' && (m || url.searchParams.get('id'))) return { url: `https://drive.usercontent.google.com/download?id=${m ? m[1] : url.searchParams.get('id')}&export=download&confirm=t`, site: false };
+  if (/dropbox\.com$/.test(h)) { url.searchParams.set('dl', '1'); return { url: url.href, site: false }; }
+  return { url: url.href, site: VIDEO_SITES.test(h) };
+}
+const safeName = s => String(s || 'Download').replace(/[\\/:*?"<>|\x00-\x1f]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 90) || 'Download';
+function linkResult(p) {
+  const name = path.basename(p), ext = path.extname(p).slice(1).toLowerCase();
+  const mime = { mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav', ogg: 'audio/ogg', opus: 'audio/ogg', webm: 'video/webm', mkv: 'video/x-matroska', mov: 'video/quicktime' }[ext] || 'video/mp4';
+  return { url: 'capmap://local/' + encodeURIComponent(name), name: name.replace(/^link_([a-z0-9]{6,10}_)?/, ''), mime, path: p };
+}
+async function toMp3(e, id, src) {
+  if (/\.mp3$/i.test(src)) return src;
+  const out = src.replace(/\.[^.]+$/, '') + '.mp3';
+  try { await runFfmpeg(e, id, src, ['-vn', '-c:a', 'libmp3lame', '-q:a', '2'], out, 'mp3'); }
+  catch (x) { try { fs.unlinkSync(src); } catch (y) {} throw new Error(/does not contain any stream|matches no streams/i.test(x.message) ? 'LINK_NOAUDIO' : x.message); }
+  try { fs.unlinkSync(src); } catch (x) {}
+  return out;
+}
+/* ---------- screen recording: source list, chosen source, and the small control bar that is not recorded itself ---------- */
+let REC_PICK = null, recBar = null;
+ipcMain.handle('rec-sources', async () => {
+  const own = new Set(BrowserWindow.getAllWindows().map(w => { try { return w.getMediaSourceId(); } catch (e) { return ''; } }));
+  const list = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 480, height: 270 }, fetchWindowIcons: true });
+  return list.filter(x => !own.has(x.id) && x.name !== 'CapMap').map(x => ({ id: x.id, name: x.name, kind: x.id.startsWith('screen') ? 'screen' : 'window',
+    thumb: x.thumbnail && !x.thumbnail.isEmpty() ? x.thumbnail.toDataURL() : '', icon: x.appIcon && !x.appIcon.isEmpty() ? x.appIcon.toDataURL() : '' }));
+});
+ipcMain.handle('rec-pick', (_e, { id, audio }) => { REC_PICK = { id, audio: !!audio }; return true; });
+ipcMain.handle('rec-bar', (e, { on, hide }) => {
+  const main = BrowserWindow.fromWebContents(e.sender);
+  if (on) {
+    if (!recBar || recBar.isDestroyed()) {
+      const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea, W = 330, H = 64;
+      recBar = new BrowserWindow({ width: W, height: H, x: Math.round(d.x + d.width / 2 - W / 2), y: d.y + d.height - H - 28, frame: false, transparent: true, resizable: false, maximizable: false, minimizable: false,
+        fullscreenable: false, alwaysOnTop: true, skipTaskbar: true, hasShadow: false, backgroundColor: '#00000000', title: 'CapMap Aufnahme',
+        webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: false } });
+      recBar.setAlwaysOnTop(true, 'screen-saver');
+      recBar.setContentProtection(true); // never part of the recording
+      try { recBar.setVisibleOnAllWorkspaces(true); } catch (err) {}
+      recBar.loadURL('capmap://app/recbar.html');
+    }
+    try { main.webContents.setBackgroundThrottling(false); } catch (err) {}
+    if (hide && main) { main.__recFs = main.isFullScreen(); if (main.__recFs) { main.once('leave-full-screen', () => main.minimize()); main.setFullScreen(false); } else main.minimize(); }
+  } else {
+    if (recBar && !recBar.isDestroyed()) recBar.close(); recBar = null;
+    if (main) { try { main.webContents.setBackgroundThrottling(true); } catch (err) {} if (main.isMinimized()) main.restore(); main.show(); main.focus(); if (main.__recFs) { main.__recFs = false; main.setFullScreen(true); } }
+  }
+  return true;
+});
+ipcMain.on('rec-state', (_e, st) => { if (recBar && !recBar.isDestroyed()) recBar.webContents.send('rec-state', st); });
+ipcMain.on('rec-cmd', (e, cmd) => { for (const w of BrowserWindow.getAllWindows()) if (w !== recBar && !w.isDestroyed() && w.webContents !== e.sender) w.webContents.send('rec-cmd', cmd); });
+
+ipcMain.handle('link-status', () => ({ ytdlp: findYtdlp() }));
+ipcMain.handle('ytdlp-pick', async (e) => {
+  const w = BrowserWindow.fromWebContents(e.sender);
+  const r = await dialog.showOpenDialog(w, { title: 'yt-dlp auswählen', properties: ['openFile'], filters: process.platform === 'win32' ? [{ name: 'yt-dlp', extensions: ['exe'] }] : [] });
+  if (r.canceled || !r.filePaths[0]) return { ytdlp: findYtdlp() };
+  linkPrefSave({ ytdlp: r.filePaths[0] }); return { ytdlp: findYtdlp() };
+});
+ipcMain.handle('link-cancel', (_e, id) => { const j = LINKS.get(id); if (j) { j.cancelled = true; try { j.abort && j.abort(); } catch (x) {} try { j.proc && j.proc.kill(); } catch (x) {} } return true; });
+ipcMain.handle('link-download', async (e, { id, url: raw, kind, quality }) => {
+  const N = linkNormalize(raw); if (!N) throw new Error('LINK_BAD');
+  const job = { cancelled: false }; LINKS.set(id, job);
+  const send = (p, phase) => { try { e.sender.send('link-progress', { id, p, phase }); } catch (x) {} };
+  try {
+    // 1) not a video site: try it as a direct file
+    if (!N.site) {
+      const ctl = new AbortController(); job.abort = () => ctl.abort();
+      const res = await net.fetch(N.url, { signal: ctl.signal, redirect: 'follow' });
+      if (!res.ok) throw new Error('LINK_HTTP ' + res.status);
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      const cd = res.headers.get('content-disposition') || '';
+      let fname = (/filename\*=UTF-8''([^;]+)/i.exec(cd) || [])[1] || (/filename="?([^";]+)"?/i.exec(cd) || [])[1] || decodeURIComponent(new URL(res.url || N.url).pathname.split('/').pop() || '');
+      try { fname = decodeURIComponent(fname); } catch (x) {}
+      const media = /^(video|audio)\//.test(ct) || /\.(mp4|mov|m4v|mkv|webm|avi|ts|mts|flv|mp3|m4a|wav|aac|ogg|opus|flac)$/i.test(fname) || (/octet-stream/.test(ct) && /\.\w{2,4}$/.test(fname));
+      if (media) {
+        if (!/\.\w{2,4}$/.test(fname)) fname += ct.startsWith('audio/') ? '.mp3' : '.mp4';
+        const out = path.join(CONV, 'link_' + Date.now().toString(36) + '_' + safeName(fname));
+        const total = +res.headers.get('content-length') || 0; let got = 0;
+        const ws = fs.createWriteStream(out);
+        const rd = res.body.getReader();
+        try {
+          for (;;) { const { done, value } = await rd.read(); if (done) break; got += value.length;
+            if (!ws.write(Buffer.from(value))) await new Promise(r => ws.once('drain', r));
+            send(total ? Math.min(.98, got / total) * (kind === 'mp3' ? .85 : 1) : -got, 'download'); }
+        } finally { await new Promise(r => ws.end(r)); }
+        if (job.cancelled) { try { fs.unlinkSync(out); } catch (x) {} throw new Error('LINK_CANCEL'); }
+        const fin = kind === 'mp3' ? await toMp3(e, id, out) : out;
+        send(1, 'done'); return { ...linkResult(fin), via: 'direct' };
+      }
+      try { ctl.abort(); } catch (x) {}
+      // an ordinary web page: only yt-dlp could read the video out of it
+    }
+    // 2) video sites and pages: yt-dlp, only when the user has it
+    const yt = findYtdlp(); if (!yt) throw new Error(N.site ? 'NEED_YTDLP' : 'LINK_NOT_MEDIA');
+    const q = { best: 4320, '1080': 1080, '720': 720, '480': 480 }[String(quality || 'best')] || 4320;
+    const fmt = kind === 'mp3' ? ['-x', '--audio-format', 'mp3', '--audio-quality', '0']
+      // H.264 (avc1) first: plays and seeks everywhere right away (vorschau, ClipMap-Ausschnitt). YouTube's mp4 streams above that are
+      // often AV1, which many PCs cannot show without converting first (black picture). Only if there is no H.264 take the rest.
+      : ['-f', `bv*[height<=${q}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=${q}][ext=mp4][vcodec!^=av01]+ba[ext=m4a]/bv*[height<=${q}][ext=mp4]+ba[ext=m4a]/bv*[height<=${q}]+ba/b[height<=${q}]/b`, '--merge-output-format', 'mp4'];
+    // --print makes yt-dlp quiet, so the progress lines must be switched back on (--progress); -N loads several pieces at once
+    const args = [...fmt, '--no-playlist', '--newline', '--progress', '-N', '4', '--no-mtime', '--restrict-filenames', '--ffmpeg-location', FFMPEG,
+      '-o', path.join(CONV, 'link_%(title).70B_%(id)s.%(ext)s'), '--print', 'after_move:filepath', raw];
+    const stages = kind === 'mp3' ? 1 : 2; let stage = 0, last = 0, outPath = '', err = '';
+    await new Promise((resolve, reject) => {
+      // apps started from the Dock/Finder do not get the shell PATH: add yt-dlp's own folder and the usual Homebrew folders,
+      // so yt-dlp also finds its helpers (deno for YouTube, ffmpeg, python)
+      const extra = [path.dirname(yt), ...(process.platform === 'win32' ? [] : ['/opt/homebrew/bin', '/usr/local/bin', path.join(os.homedir(), '.local', 'bin'), path.join(os.homedir(), '.deno', 'bin')])];
+      const env = { ...process.env, PATH: [...extra, process.env.PATH || ''].join(path.delimiter) };
+      const p = spawn(yt, args, { windowsHide: true, env }); job.proc = p;
+      const onLine = l => {
+        const m = /\[download\]\s+([\d.]+)%/.exec(l);
+        if (m) { const v = +m[1]; if (v < last - 50) stage = Math.min(stages - 1, stage + 1); last = v; send(Math.min(.97, (stage + v / 100) / stages), 'ytdlp'); return; }
+        if (/^\[(Merger|ExtractAudio|VideoConvertor)\]/.test(l)) send(.98, 'merge');
+        const t = l.trim(); if (t && !t.startsWith('[') && fs.existsSync(t)) outPath = t;
+      };
+      let buf = '';
+      p.stdout.on('data', d => { buf += d; const ls = buf.split(/\r?\n/); buf = ls.pop(); ls.forEach(onLine); });
+      p.stderr.on('data', d => { err = (err + d).slice(-4000); });
+      p.on('error', reject);
+      p.on('close', code => { if (buf) onLine(buf); if (job.cancelled) reject(new Error('LINK_CANCEL')); else if (code === 0 && outPath) resolve(); else reject(new Error('YTDLP ' + (err.split('\n').filter(x => /ERROR/.test(x)).pop() || err.split('\n').slice(-2).join(' ')).trim())); });
+    });
+    send(1, 'done'); return { ...linkResult(outPath), via: 'ytdlp' };
+  } finally { LINKS.delete(id); }
+});
+/* ---------- own window buttons and full screen ---------- */
+function winPref() { try { return JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'fenster.json'), 'utf8')) || {}; } catch (e) { return {}; } }
+function winPrefSave(o) { try { fs.writeFileSync(path.join(app.getPath('userData'), 'fenster.json'), JSON.stringify({ ...winPref(), ...o })); } catch (e) {} }
+const winState = w => ({ fs: w.isFullScreen(), max: w.isMaximized(), mac: process.platform === 'darwin' });
+ipcMain.handle('win', (e, cmd) => {
+  const w = BrowserWindow.fromWebContents(e.sender); if (!w) return null;
+  if (cmd === 'min') w.minimize();
+  else if (cmd === 'close') w.close();
+  else if (cmd === 'max') { if (w.isFullScreen()) w.setFullScreen(false); w.isMaximized() ? w.unmaximize() : w.maximize(); }
+  else if (cmd === 'fs') { const f = !w.isFullScreen(); w.setFullScreen(f); if (!f) setTimeout(() => { try { w.maximize(); } catch (x) {} }, 60); winPrefSave({ fs: f }); }
+  return winState(w);
+});
+function createWindow() {
+  // open at the full screen size right away, so the first picture is not drawn small and then stretched
+  let wa = { width: 1440, height: 900 };
+  try { wa = screen.getPrimaryDisplay().workArea; } catch (e) {}
+  const win = new BrowserWindow({
+    x: wa.x, y: wa.y, width: wa.width, height: wa.height, minWidth: 900, minHeight: 600,
+    backgroundColor: '#000000', title: 'CapMap', autoHideMenuBar: true, show: false,
+    // no grey system title bar: CapMap draws its own window buttons inside its top bar (the Mac keeps its traffic lights)
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden', ...(process.platform === 'darwin' ? { trafficLightPosition: { x: 16, y: 18 } } : {}),
+    icon: path.join(WEB, 'icons', 'favicon.ico'),
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: false, spellcheck: false }
+  });
+  // Windows: full screen by default (covers the task bar); the choice is remembered
+  win.once('ready-to-show', () => { if (process.platform === 'win32' && winPref().fs !== false) win.setFullScreen(true); else win.maximize(); win.show(); });
+  const sendState = () => { try { win.webContents.send('win-state', winState(win)); } catch (e) {} };
+  for (const ev of ['enter-full-screen', 'leave-full-screen', 'maximize', 'unmaximize']) win.on(ev, sendState);
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/.test(url)) { shell.openExternal(url); return { action: 'deny' }; }
+    return { action: 'allow' };
+  });
+  win.loadURL('capmap://app/index.html');
+  return win;
+}
+
+/* ---------- licence (Lemon Squeezy): without a valid key the window shows only the unlock page (web/lizenz.html).
+   The key is activated once online; after that CapMap checks it quietly every day and keeps working 14 days offline. ---------- */
+const LS_STORE = 503552, LS_PRODUCTS = [1486484];   // test-mode product; the live-mode copy gets its own ID, add it here
+const LS_BUY = 'https://capclipmap.lemonsqueezy.com/checkout/buy/7cf9acec-8afb-4eb7-b4ea-9ece66ad3978';
+const LIC_GRACE = 14 * 864e5, LIC_RECHECK = 864e5;
+const licFile = () => path.join(app.getPath('userData'), 'lizenz.json');
+const licSig = o => crypto.createHmac('sha256', 'cm-lic-7f3a91|' + os.hostname() + '|' + app.getPath('userData')).update([o.key, o.inst, o.ok].join('|')).digest('hex');
+function licRead() { try { const o = JSON.parse(fs.readFileSync(licFile(), 'utf8')); return o && o.key && o.sig === licSig(o) ? o : null; } catch (e) { return null; } }
+function licWrite(o) { o.sig = licSig(o); fs.writeFileSync(licFile(), JSON.stringify(o)); }
+function licClear() { try { fs.unlinkSync(licFile()); } catch (e) {} }
+let LIC_OK = (() => { const o = licRead(); return !!(o && Date.now() - o.ok < LIC_GRACE); })();
+async function lsCall(what, params) {
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 15000);
+  try {
+    const r = await net.fetch('https://api.lemonsqueezy.com/v1/licenses/' + what, { method: 'POST', signal: ctl.signal,
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(params).toString() });
+    const j = await r.json().catch(() => ({}));
+    return { net: true, status: r.status, j };
+  } catch (e) { return { net: false }; } finally { clearTimeout(t); }
+}
+const licMetaOk = m => !!m && +m.store_id === LS_STORE && (!LS_PRODUCTS.length || LS_PRODUCTS.includes(+m.product_id));
+const licView = o => o ? { key: o.key.slice(0, 4) + '••••' + o.key.slice(-4), name: o.name || '', email: o.email || '', ok: o.ok } : null;
+// asks Lemon Squeezy; true = valid, false = definitely not (any more), null = no answer (offline)
+async function licValidate(o) {
+  const r = await lsCall('validate', { license_key: o.key, instance_id: o.inst });
+  if (!r.net || r.status >= 500 || r.status === 429) return { v: null };
+  const j = r.j || {}, st = j.license_key && j.license_key.status;
+  if (j.valid && licMetaOk(j.meta) && st !== 'disabled' && st !== 'expired') return { v: true };
+  return { v: false, why: st === 'expired' ? 'Deine Lizenz ist abgelaufen.' : st === 'disabled' ? 'Diese Lizenz wurde deaktiviert.' : 'Diese Lizenz gilt auf diesem Gerät nicht mehr.' };
+}
+function licRelock(why) {
+  LIC_OK = false; LIC_WHY = why || '';
+  for (const w of BrowserWindow.getAllWindows()) try { if (!w.isDestroyed() && /^capmap:\/\/app\//.test(w.webContents.getURL()) && !/recbar/.test(w.webContents.getURL())) w.loadURL('capmap://app/index.html'); } catch (e) {}
+}
+let LIC_WHY = '';
+async function licBackground() {
+  const o = licRead(); if (!o || Date.now() - o.ok < LIC_RECHECK) return;
+  const r = await licValidate(o);
+  if (r.v === true) licWrite({ ...o, ok: Date.now() });
+  else if (r.v === false) { licClear(); licRelock(r.why); }
+}
+ipcMain.handle('lic-status', async () => {
+  const o = licRead();
+  if (!o) return { state: 'none', why: LIC_WHY, buy: LS_BUY };
+  if (Date.now() - o.ok < LIC_RECHECK) { LIC_OK = true; return { state: 'ok', lic: licView(o), buy: LS_BUY }; }
+  const r = await licValidate(o);
+  if (r.v === true) { const n = { ...o, ok: Date.now() }; licWrite(n); LIC_OK = true; return { state: 'ok', lic: licView(n), buy: LS_BUY }; }
+  if (r.v === false) { licClear(); LIC_OK = false; return { state: 'none', why: r.why, buy: LS_BUY }; }
+  if (Date.now() - o.ok < LIC_GRACE) { LIC_OK = true; return { state: 'ok', offline: true, lic: licView(o), buy: LS_BUY }; }
+  LIC_OK = false; return { state: 'offline', lic: licView(o), buy: LS_BUY };
+});
+ipcMain.handle('lic-activate', async (_e, raw) => {
+  const key = String(raw || '').trim();
+  if (!/^[A-Za-z0-9-]{16,}$/.test(key)) return { err: 'Das sieht nicht nach einem Lizenzschlüssel aus. Kopiere ihn am besten direkt aus der E-Mail.' };
+  const r = await lsCall('activate', { license_key: key, instance_name: (os.hostname() || 'Rechner') + ' · ' + ({ win32: 'Windows', darwin: 'Mac' }[process.platform] || process.platform) });
+  if (!r.net) return { err: 'Keine Verbindung. Für die Freischaltung braucht CapMap einmal Internet.' };
+  const j = r.j || {};
+  if (!j.activated) {
+    const e = String(j.error || '');
+    if (/limit/i.test(e)) return { err: 'Dieser Schlüssel ist schon auf der erlaubten Anzahl Geräte aktiv. Melde ihn auf einem anderen Gerät ab (Optionen → Lizenz) und versuche es dann noch einmal.' };
+    if (/expired/i.test(e)) return { err: 'Diese Lizenz ist abgelaufen.' };
+    if (/disabled/i.test(e)) return { err: 'Diese Lizenz wurde deaktiviert.' };
+    return { err: 'Dieser Lizenzschlüssel ist nicht gültig. Prüfe, ob du ihn vollständig kopiert hast.' };
+  }
+  if (!licMetaOk(j.meta)) { if (j.instance) lsCall('deactivate', { license_key: key, instance_id: j.instance.id }); return { err: 'Dieser Schlüssel gehört nicht zu CapMap.' }; }
+  licWrite({ key, inst: j.instance.id, ok: Date.now(), name: (j.meta && j.meta.customer_name) || '', email: (j.meta && j.meta.customer_email) || '' });
+  LIC_OK = true; LIC_WHY = '';
+  return { ok: true };
+});
+ipcMain.handle('lic-deactivate', async () => {
+  const o = licRead(); if (!o) { licRelock(''); return { ok: true }; }
+  const r = await lsCall('deactivate', { license_key: o.key, instance_id: o.inst });
+  if (!r.net) return { err: 'Keine Verbindung. Zum Abmelden braucht CapMap kurz Internet, damit das Gerät wieder frei wird.' };
+  licClear(); setTimeout(() => licRelock(''), 300);
+  return { ok: true };
+});
+ipcMain.handle('lic-enter', e => { if (!LIC_OK) return false; const w = BrowserWindow.fromWebContents(e.sender); if (w) w.loadURL('capmap://app/index.html'); return true; });
+
+app.on('second-instance', () => {
+  writeBridge();
+  const w = BrowserWindow.getAllWindows()[0];
+  if (w) { if (w.isMinimized()) w.restore(); w.focus(); }
+});
+
+/* Windows: updates replace the app files but not the shortcuts the installer made, so after a logo change the
+   desktop / start menu / taskbar shortcuts would keep the old icon. Point them at the current icon instead. The
+   icon file name carries a hash of its content, so Windows' icon cache picks up every future logo change too. */
+function fixShortcutIcons() {
+  try {
+    const src = path.join(WEB, 'icons', 'favicon.ico'); if (!fs.existsSync(src)) return;
+    const buf = fs.readFileSync(src), dir = path.join(app.getPath('userData'), 'symbol');
+    const ico = path.join(dir, 'capmap-' + crypto.createHash('sha1').update(buf).digest('hex').slice(0, 10) + '.ico');
+    if (!fs.existsSync(ico)) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(ico, buf); for (const f of fs.readdirSync(dir)) if (/^capmap-.*\.ico$/.test(f) && path.join(dir, f) !== ico) try { fs.unlinkSync(path.join(dir, f)); } catch (e) {} }
+    const ad = process.env.APPDATA || '', exe = process.execPath.toLowerCase();
+    const links = [path.join(app.getPath('desktop'), 'CapMap.lnk'), path.join(ad, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'CapMap.lnk'),
+      path.join(ad, 'Microsoft', 'Internet Explorer', 'Quick Launch', 'User Pinned', 'TaskBar', 'CapMap.lnk'), path.join(ad, 'Microsoft', 'Internet Explorer', 'Quick Launch', 'CapMap.lnk')];
+    for (const l of links) {
+      try {
+        if (!fs.existsSync(l)) continue;
+        const sc = shell.readShortcutLink(l);
+        if (!sc.target || sc.target.toLowerCase() !== exe) continue;   // only CapMap's own shortcuts
+        if ((sc.icon || '').toLowerCase() === ico.toLowerCase()) continue;
+        shell.writeShortcutLink(l, 'update', { icon: ico, iconIndex: 0 });
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+app.whenReady().then(() => {
+  // Mac: the Dock shows the current CapMap logo even on installs whose .app bundle still carries an older icon
+  if (process.platform === 'darwin' && app.dock) { try { app.dock.setIcon(path.join(WEB, 'icons', 'icon-512.png')); } catch (e) {} }
+  if (process.platform === 'win32') setTimeout(fixShortcutIcons, 3000);
+  setTimeout(() => licBackground().catch(() => {}), 8000); setInterval(() => licBackground().catch(() => {}), 6 * 3600e3);
+  // macOS needs a small app menu, otherwise Cmd+C/V/Q and the like do not work
+  Menu.setApplicationMenu(process.platform === 'darwin' ? Menu.buildFromTemplate([{ role: 'appMenu', label: 'CapMap' }, { role: 'editMenu', label: 'Bearbeiten' }, { role: 'windowMenu', label: 'Fenster' }]) : null);
+  CONV = path.join(app.getPath('userData'), 'umgewandelt');
+  fs.mkdirSync(CONV, { recursive: true });
+  // finished exports are kept a day (for saving and uploading), then removed
+  try { for (const f of fs.readdirSync(CONV)) if (/^export-/.test(f)) { const p = path.join(CONV, f); if (Date.now() - fs.statSync(p).mtimeMs > 864e5) fs.unlinkSync(p); } } catch (e) {}
+
+  protocol.handle('capmap', req => {
+    const u = new URL(req.url);
+    // files from a folder the user asked Claude to import (only inside folders listed before)
+    if (u.host === 'file') {
+      const fp = decodeURIComponent(u.pathname.replace(/^\/+/, ''));
+      const ok = fp && [...READ_ROOTS].some(r => { const rel = path.relative(r, fp); return rel && !rel.startsWith('..') && !path.isAbsolute(rel); });
+      if (!ok || !fs.existsSync(fp)) return new Response('not found', { status: 404 });
+      return serveFile(fp, req);
+    }
+    const root = u.host === 'local' ? CONV : WEB;
+    let rel = u.pathname.replace(/^\/+/, '') || 'index.html';
+    // no valid licence: the app page is replaced by the unlock page (also for reloads or typed addresses)
+    if (root === WEB && !LIC_OK && (rel === 'index.html' || rel === 'test.html')) rel = 'lizenz.html';
+    let p = inside(root, rel);
+    if (p && !fs.existsSync(p) && root === WEB && WEB_BASE !== WEB) p = inside(WEB_BASE, rel);
+    if (!p || !fs.existsSync(p)) return new Response('not found', { status: 404 });
+    if (root !== WEB) return serveFile(p, req);
+    // cross-origin isolation: lets the cut-out and speech models use several processor cores
+    return net.fetch(pathToFileURL(p).toString(), { headers: req.headers }).then(r => {
+      const h = new Headers(r.headers); h.set('Cross-Origin-Opener-Policy', 'same-origin'); h.set('Cross-Origin-Embedder-Policy', 'credentialless');
+      return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+    });
+  });
+
+  session.defaultSession.setPermissionRequestHandler((_wc, perm, cb) => cb(['media', 'mediaKeySystem', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen', 'notifications', 'display-capture'].includes(perm)));
+  // screen recording: the page chose a screen or window in its own picker (rec-pick), getDisplayMedia gets exactly that one
+  session.defaultSession.setDisplayMediaRequestHandler(async (_req, cb) => {
+    try {
+      const P = REC_PICK, list = await desktopCapturer.getSources({ types: ['screen', 'window'] });
+      const src = (P && list.find(x => x.id === P.id)) || list.find(x => x.id.startsWith('screen'));
+      if (!src) { cb({}); return; }
+      cb({ video: src, ...(P && P.audio && process.platform === 'win32' ? { audio: 'loopback' } : {}) });
+    } catch (e) { cb({}); }
+  });
+  session.defaultSession.setPermissionCheckHandler(() => true);
+
+  const mainWin = createWindow();
+  require('./updater').initUpdater(mainWin);
+  startBridge();
+});
+
+app.on('window-all-closed', () => app.quit());
+
+// exported videos: a real "Save as" dialog (starts in the Videos folder) and "show in folder" for uploading
+ipcMain.handle('save-video', async (e, { name, data }) => {
+  const win = BrowserWindow.fromWebContents(e.sender);
+  const safe = String(name || 'Video.mp4').replace(/[\\/:*?"<>|]+/g, '').trim() || 'Video.mp4', ext = path.extname(safe).slice(1) || 'mp4';
+  const r = await dialog.showSaveDialog(win, { title: 'Video speichern', defaultPath: path.join(app.getPath('videos'), safe), filters: [{ name: 'Video', extensions: [ext] }] });
+  if (r.canceled || !r.filePath) return null;
+  await fs.promises.writeFile(r.filePath, Buffer.from(data));
+  return r.filePath;
+});
+// ---------- frame-by-frame export: the page sends the encoded video, the mixed sound as WAV, ffmpeg puts both into one MP4
+const EXP = new Map();
+ipcMain.handle('exp-begin', () => {
+  const id = crypto.randomBytes(6).toString('hex'), dir = CONV;
+  const v = path.join(dir, `export-${id}.video.mp4`), a = path.join(dir, `export-${id}.audio.wav`);
+  EXP.set(id, { v, a, fv: fs.openSync(v, 'w'), fa: null });
+  return id;
+});
+ipcMain.handle('exp-write', (_e, { id, kind, pos, data }) => {
+  const x = EXP.get(id); if (!x) throw new Error('Export unbekannt');
+  if (kind === 'a' && x.fa == null) x.fa = fs.openSync(x.a, 'w');
+  const fd = kind === 'a' ? x.fa : x.fv, b = Buffer.from(data);
+  fs.writeSync(fd, b, 0, b.length, pos); return true;
+});
+function expClean(x, keepOut) { for (const fd of [x.fv, x.fa]) if (fd != null) { try { fs.closeSync(fd); } catch (e) {} } x.fv = x.fa = null; for (const p of [x.v, x.a]) { try { fs.unlinkSync(p); } catch (e) {} } }
+ipcMain.handle('exp-cancel', (_e, id) => { const x = EXP.get(id); if (x) { expClean(x); EXP.delete(id); } return true; });
+ipcMain.handle('exp-finish', (e, { id, name, audio }) => new Promise((resolve, reject) => {
+  const x = EXP.get(id); if (!x) return reject(new Error('Export unbekannt'));
+  for (const k of ['fv', 'fa']) if (x[k] != null) { fs.closeSync(x[k]); x[k] = null; }
+  const outName = `export-${id}.mp4`, out = path.join(CONV, outName);
+  const done = () => { expClean(x); EXP.delete(id); const st = fs.statSync(out); resolve({ path: out, url: 'capmap://local/' + encodeURIComponent(outName), size: st.size }); };
+  if (!audio || !fs.existsSync(x.a)) { fs.renameSync(x.v, out); return done(); }
+  if (!fs.existsSync(FFMPEG)) { fs.renameSync(x.v, out); return done(); }
+  const p = spawn(FFMPEG, ['-hide_banner', '-y', '-i', x.v, '-i', x.a, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', out], { windowsHide: true });
+  let err = ''; p.stderr.on('data', d => { err = (err + d).slice(-4000); });
+  p.on('error', er => { try { fs.renameSync(x.v, out); done(); } catch (z) { reject(er); } });
+  p.on('close', code => { if (code === 0) done(); else { try { fs.renameSync(x.v, out); done(); } catch (z) { reject(new Error('ffmpeg: ' + err.split('\n').slice(-3).join(' '))); } } });
+}));
+ipcMain.handle('save-exported', async (e, { src, name }) => {
+  const win = BrowserWindow.fromWebContents(e.sender), ext = path.extname(name).slice(1) || 'mp4';
+  const r = await dialog.showSaveDialog(win, { title: 'Video speichern', defaultPath: path.join(app.getPath('videos'), name), filters: [{ name: 'Video', extensions: [ext] }] });
+  if (r.canceled || !r.filePath) return null;
+  await fs.promises.copyFile(src, r.filePath); return r.filePath;
+});
+ipcMain.handle('copy-exported', async (_e, { src, dir, name }) => {
+  let p = path.join(dir, name), n = 2; const ext = path.extname(name), base = name.slice(0, name.length - ext.length);
+  while (fs.existsSync(p)) p = path.join(dir, `${base} (${n++})${ext}`);
+  await fs.promises.copyFile(src, p); return p;
+});
+ipcMain.handle('pick-folder', async e => {
+  const r = await dialog.showOpenDialog(BrowserWindow.fromWebContents(e.sender), { title: 'Ordner für die Videos wählen', defaultPath: app.getPath('videos'), properties: ['openDirectory', 'createDirectory'] });
+  return r.canceled || !r.filePaths[0] ? null : r.filePaths[0];
+});
+ipcMain.handle('write-video', async (_e, { dir, name, data }) => {
+  const safe = String(name || 'Video.mp4').replace(/[\\/:*?"<>|]+/g, '').trim() || 'Video.mp4';
+  let p = path.join(dir, safe), n = 2; const ext = path.extname(safe), base = safe.slice(0, safe.length - ext.length);
+  while (fs.existsSync(p)) p = path.join(dir, `${base} (${n++})${ext}`);
+  await fs.promises.writeFile(p, Buffer.from(data)); return p;
+});
+ipcMain.handle('open-folder', (_e, p) => shell.openPath(p));
+ipcMain.handle('show-in-folder', (_e, p) => { if (p && fs.existsSync(p)) { shell.showItemInFolder(p); return true; } return false; });
+
+/* ---------- Claude connector: a local door for the CapMap connector (capmap-mcp.js) used by the Claude app ----------
+   Only this computer can reach it (127.0.0.1) and only with the secret token from ~/.capmap/bridge.json. */
+const BRIDGE_DIR = path.join(os.homedir(), '.capmap'), BRIDGE_FILE = path.join(BRIDGE_DIR, 'bridge.json');
+const pending = new Map(); let reqSeq = 0;
+function askRenderer(msg) {
+  return new Promise((resolve, reject) => {
+    const w = BrowserWindow.getAllWindows()[0]; if (!w) return reject(new Error('Das CapMap-Fenster ist nicht offen.'));
+    const id = ++reqSeq, t = setTimeout(() => { pending.delete(id); reject(new Error('Zeitüberschreitung')); }, 30 * 60 * 1000);
+    pending.set(id, v => { clearTimeout(t); resolve(v); });
+    w.webContents.send('bridge-req', { id, ...msg });
+  });
+}
+ipcMain.on('bridge-res', (_e, m) => { const f = pending.get(m.id); if (f) { pending.delete(m.id); f(m.error ? { error: m.error } : { result: m.result }); } });
+let BRIDGE_INFO = null;
+function writeBridge() { if (!BRIDGE_INFO) return; try { fs.mkdirSync(BRIDGE_DIR, { recursive: true }); fs.writeFileSync(BRIDGE_FILE, JSON.stringify(BRIDGE_INFO)); } catch (e) {} }
+function startBridge() {
+  const token = crypto.randomBytes(24).toString('hex');
+  const srv = http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.headers['x-capmap-token'] !== token) { res.writeHead(403); return res.end(); }
+    let body = '';
+    req.on('data', d => { body += d; if (body.length > 2e6) req.destroy(); });
+    req.on('end', async () => {
+      let out;
+      lastCall = Date.now();
+      try { const m = body ? JSON.parse(body) : {}; out = await askRenderer(req.url === '/tools' ? { op: 'list' } : { op: 'call', name: m.name, input: m.input || {} }); }
+      catch (e) { out = { error: String(e && e.message || e) }; }
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(out));
+    });
+  });
+  srv.listen(0, '127.0.0.1', () => { BRIDGE_INFO = { port: srv.address().port, token, pid: process.pid }; writeBridge(); });
+}
+app.on('will-quit', () => { try { const b = JSON.parse(fs.readFileSync(BRIDGE_FILE, 'utf8')); if (b.pid === process.pid) fs.unlinkSync(BRIDGE_FILE); } catch (e) {} });
+function claudeConfigDirs() {
+  const appdata = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  const dirs = process.platform === 'darwin' ? [path.join(os.homedir(), 'Library', 'Application Support', 'Claude')] : [path.join(appdata, 'Claude')];
+  try { const pk = path.join(process.env.LOCALAPPDATA || '', 'Packages'); for (const d of fs.readdirSync(pk)) if (/^(AnthropicPBC\.)?Claude/i.test(d)) dirs.push(path.join(pk, d, 'LocalCache', 'Roaming', 'Claude')); } catch (e) {}
+  return dirs;
+}
+let lastCall = 0;
+ipcMain.handle('claude-status', () => {
+  let connected = false;
+  for (const d of claudeConfigDirs()) { try { const c = JSON.parse(fs.readFileSync(path.join(d, 'claude_desktop_config.json'), 'utf8')); if (c.mcpServers && c.mcpServers.capmap) connected = true; } catch (e) {} }
+  return { connected, lastCall };
+});
+ipcMain.handle('claude-open', () => shell.openExternal('claude://').then(() => true, () => false));
+
+
+/* ---------- CapMap and the Claude app side by side (Windows): CapMap left, Claude right ---------- */
+function moveClaudeWindow(x, y, w, h) {
+  return new Promise(resolve => {
+    const ps = `Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class CmW { [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); }
+'@
+$p = Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+if ($p) { [CmW]::ShowWindow($p.MainWindowHandle, 9) | Out-Null; Start-Sleep -Milliseconds 150; [CmW]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, ${x}, ${y}, ${w}, ${h}, 0x0040) | Out-Null; [CmW]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; 'ok' } else { 'none' }`;
+    const pr = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps], { windowsHide: true });
+    let out = ''; pr.stdout.on('data', d => { out += d; }); pr.on('error', () => resolve(false)); pr.on('close', () => resolve(/ok/.test(out)));
+  });
+}
+ipcMain.handle('claude-dock', async (e, on) => {
+  const win = BrowserWindow.fromWebContents(e.sender); if (!win) return { ok: false };
+  if (!on) { win.maximize(); return { ok: true }; }
+  if (win.isFullScreen()) { win.setFullScreen(false); await new Promise(r => setTimeout(r, 400)); }
+  if (process.platform !== 'win32') return { ok: false, reason: 'nur Windows' };
+  const d = screen.getDisplayMatching(win.getBounds()), wa = d.workArea, sf = d.scaleFactor || 1;
+  const cw = Math.max(440, Math.round(wa.width * .3)), mw = wa.width - cw;
+  if (win.isMaximized()) win.unmaximize();
+  win.setBounds({ x: wa.x, y: wa.y, width: mw, height: wa.height });
+  const px = r => Math.round(r * sf);
+  let ok = await moveClaudeWindow(px(wa.x + mw), px(wa.y), px(cw), px(wa.height));
+  if (!ok) {
+    // the Claude app is not open yet: start it and wait for its window
+    try { await shell.openExternal('claude://'); } catch (x) {}
+    for (let i = 0; i < 20 && !ok; i++) { await new Promise(r => setTimeout(r, 1000)); ok = await moveClaudeWindow(px(wa.x + mw), px(wa.y), px(cw), px(wa.height)); }
+  }
+  return { ok };
+});
+/* ---------- chat inside CapMap with the user's Claude subscription, through Claude Code (claude -p) ----------
+   Claude Code runs headless, only with the CapMap tools (via capmap-mcp.js); answers stream back into the CapMap chat. */
+function findClaude() {
+  const home = os.homedir(), exe = process.platform === 'win32' ? 'claude.exe' : 'claude';
+  const c = [process.env.CAPMAP_CLAUDE, path.join(home, '.local', 'bin', exe)];
+  for (const d of (process.env.PATH || '').split(path.delimiter)) if (d) c.push(path.join(d, exe));
+  // apps started from the Finder do not get the shell PATH
+  if (process.platform === 'darwin') for (const d of ['/opt/homebrew/bin', '/usr/local/bin', path.join(home, '.npm-global', 'bin'), path.join(home, '.claude', 'local'), path.join(home, '.bun', 'bin')]) c.push(path.join(d, 'claude'));
+  if (process.platform === 'win32') { c.push(path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WinGet', 'Links', 'claude.exe')); c.push(path.join(process.env.APPDATA || '', 'npm', 'claude.cmd')); for (const d of (process.env.PATH || '').split(path.delimiter)) if (d) c.push(path.join(d, 'claude.cmd')); }
+  return c.find(f => f && fs.existsSync(f)) || null;
+}
+let ccProc = null;
+ipcMain.handle('cc-status', () => ({ path: findClaude() }));
+ipcMain.handle('cc-stop', () => { if (ccProc) { try { ccProc.kill(); } catch (e) {} } return true; });
+ipcMain.handle('cc-login', () => {
+  const exe = findClaude();
+  if (process.platform === 'darwin') {
+    const sh = exe ? `'${exe.replace(/'/g, "'\\''")}'` : 'curl -fsSL https://claude.ai/install.sh | bash && ~/.local/bin/claude';
+    const script = `echo "CapMap: Claude Code einrichten. Melde dich im Browser mit deinem Claude-Konto an, danach dieses Fenster schliessen."; ${sh}`;
+    spawn('osascript', ['-e', `tell application "Terminal" to do script ${JSON.stringify(script)}`, '-e', 'tell application "Terminal" to activate'], { detached: true, stdio: 'ignore' }).unref();
+    return true;
+  }
+  if (process.platform !== 'win32') return false;
+  const cmd = exe ? `& '${exe}'` : `irm https://claude.ai/install.ps1 | iex; & "$env:USERPROFILE\\.local\\bin\\claude.exe"`;
+  spawn('cmd.exe', ['/c', 'start', 'powershell', '-NoExit', '-Command', `Write-Host 'CapMap: Claude Code einrichten. Melde dich im Browser mit deinem Claude-Konto an, danach dieses Fenster schliessen.' -ForegroundColor Cyan; ${cmd}`], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+  return true;
+});
+ipcMain.handle('cc-ask', (e, { prompt, session: sid }) => new Promise(resolve => {
+  const exe = findClaude(); if (!exe) return resolve({ error: 'Claude Code ist nicht installiert.' });
+  const dir = path.join(app.getPath('userData'), 'claude-chat'); fs.mkdirSync(dir, { recursive: true });
+  const cfg = path.join(dir, 'capmap-mcp.json');
+  fs.writeFileSync(cfg, JSON.stringify({ mcpServers: { capmap: { command: process.execPath, args: [path.join(BASE, 'capmap-mcp.js')], env: { ELECTRON_RUN_AS_NODE: '1' } } } }));
+  const q = a => (exe.endsWith('.cmd') && /[\s&()]/.test(a) ? `"${a}"` : a);
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--mcp-config', q(cfg), '--strict-mcp-config', '--allowedTools', 'mcp__capmap', ...(sid ? ['--resume', sid] : []),
+    '--disallowedTools', 'Bash', 'PowerShell', 'Edit', 'Write', 'MultiEdit', 'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Task', 'NotebookEdit', 'TodoWrite', 'Monitor'];
+  const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
+  let p;
+  try { p = spawn(exe, args, { cwd: dir, env, windowsHide: true, shell: exe.endsWith('.cmd') }); } catch (err) { return resolve({ error: String(err.message || err) }); }
+  ccProc = p;
+  let buf = '', errTxt = '', session = sid || null, result = null;
+  p.stdout.setEncoding('utf8');
+  p.stdout.on('data', d => {
+    buf += d; let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1); if (!line) continue;
+      let m; try { m = JSON.parse(line); } catch (x) { continue; }
+      if (m.session_id) session = m.session_id;
+      if (m.type === 'result') result = m;
+      try { e.sender.send('cc-event', m); } catch (x) {}
+    }
+  });
+  p.stderr.on('data', d => { errTxt = (errTxt + d).slice(-4000); });
+  p.on('error', err => { ccProc = null; resolve({ error: String(err.message || err) }); });
+  p.on('close', code => { ccProc = null; resolve({ session, code, result, stderr: errTxt }); });
+  p.stdin.end(prompt);
+}));
+/* one click: enter the connector into the Claude app's settings (claude_desktop_config.json), with a backup */
+ipcMain.handle('claude-connect', () => {
+  const appdata = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  const dirs = process.platform === 'darwin' ? [path.join(os.homedir(), 'Library', 'Application Support', 'Claude')] : [path.join(appdata, 'Claude')];
+  try { const pk = path.join(process.env.LOCALAPPDATA || '', 'Packages'); for (const d of fs.readdirSync(pk)) if (/^(AnthropicPBC\.)?Claude/i.test(d)) dirs.push(path.join(pk, d, 'LocalCache', 'Roaming', 'Claude')); } catch (e) {}
+  const entry = { command: process.execPath, args: [path.join(BASE, 'capmap-mcp.js')], env: { ELECTRON_RUN_AS_NODE: '1' } };
+  const written = [];
+  dirs.forEach((d, i) => {
+    if (i > 0 && !fs.existsSync(d)) return;
+    fs.mkdirSync(d, { recursive: true });
+    const f = path.join(d, 'claude_desktop_config.json');
+    let cfg = {};
+    if (fs.existsSync(f)) {
+      const raw = fs.readFileSync(f, 'utf8');
+      try { cfg = raw.trim() ? JSON.parse(raw) : {}; } catch (e) { throw new Error('Die Einstellungsdatei der Claude-App ist nicht lesbar: ' + f); }
+      fs.writeFileSync(f + '.vor-capmap.json', raw);
+    }
+    cfg.mcpServers = cfg.mcpServers || {}; cfg.mcpServers.capmap = entry;
+    fs.writeFileSync(f, JSON.stringify(cfg, null, 2)); written.push(f);
+  });
+  return { written, entry };
+});
+
+/* ---------- import a whole folder (LUTs, motion graphics, sounds) when Claude is asked to ---------- */
+const READ_ROOTS = new Set();
+ipcMain.handle('list-folder', (e, { root }) => {
+  root = path.resolve(String(root || ''));
+  if (!root || !fs.existsSync(root) || !fs.statSync(root).isDirectory()) throw new Error('Ordner nicht gefunden: ' + root);
+  const out = [], walk = (dir, depth) => {
+    if (depth > 6 || out.length > 3000) return;
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (ent.name.startsWith('.') || ent.name === '__MACOSX') continue;
+      const fp = path.join(dir, ent.name);
+      if (ent.isDirectory()) walk(fp, depth + 1);
+      else if (ent.isFile()) out.push({ path: fp, rel: path.relative(path.dirname(root), fp).split(path.sep).join('/'), size: fs.statSync(fp).size });
+    }
+  };
+  walk(root, 0); READ_ROOTS.add(root);
+  return out;
+});
+/* big files (converted videos, sound) straight from disk in large pieces, with ranges for the player;
+   net.fetch(file://) through a custom protocol moves them in tiny pieces and is many times slower */
+const MIME = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.png': 'image/png', '.json': 'application/json', '.mov': 'video/quicktime', '.gif': 'image/gif', '.cube': 'text/plain', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg', '.flac': 'audio/flac', '.aac': 'audio/aac', '.opus': 'audio/ogg', '.m4v': 'video/mp4', '.mkv': 'video/x-matroska' };
+function serveFile(p, req) {
+  const { Readable } = require('stream');
+  const size = fs.statSync(p).size, type = MIME[path.extname(p).toLowerCase()] || 'application/octet-stream';
+  const m = /bytes=(\d*)-(\d*)/.exec(req.headers.get('range') || '');
+  if (m && size) {
+    let a = m[1] === '' ? Math.max(0, size - (+m[2] || 0)) : +m[1], b = m[1] !== '' && m[2] !== '' ? Math.min(+m[2], size - 1) : size - 1;
+    if (a > b || a >= size) return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
+    return new Response(Readable.toWeb(fs.createReadStream(p, { start: a, end: b, highWaterMark: 4 << 20 })), { status: 206, headers: { 'Content-Type': type, 'Content-Length': String(b - a + 1), 'Content-Range': `bytes ${a}-${b}/${size}`, 'Accept-Ranges': 'bytes' } });
+  }
+  return new Response(Readable.toWeb(fs.createReadStream(p, { highWaterMark: 4 << 20 })), { status: 200, headers: { 'Content-Type': type, 'Content-Length': String(size), 'Accept-Ranges': 'bytes' } });
+}
+/* ---------- ffmpeg conversion for files the player cannot decode ---------- */
+function probeDuration(stderr) {
+  const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(stderr);
+  return m ? (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) : 0;
+}
+/* graphics-card encoding: NVIDIA (NVENC), Intel (Quick Sync), AMD (AMF) on Windows, VideoToolbox on the Mac.
+   Each candidate is tried once with a tiny test encode; the first that works is used, otherwise the processor (libx264). */
+const HW_CANDIDATES = process.platform === 'darwin' ? [['h264_videotoolbox', 'Apple-Chip']]
+  : process.platform === 'win32' ? [['h264_nvenc', 'NVIDIA'], ['h264_qsv', 'Intel Quick Sync'], ['h264_amf', 'AMD']]
+  : [['h264_nvenc', 'NVIDIA'], ['h264_vaapi', 'VA-API']];
+const hwFile = () => path.join(app.getPath('userData'), 'umwandeln.json');
+const HW = { mode: 'auto', proxy: true, asr: true, enc: null, label: '', probed: false, probing: null };
+try { const j = JSON.parse(fs.readFileSync(hwFile(), 'utf8')); if (j.mode === 'off' || j.mode === 'auto') HW.mode = j.mode; if (typeof j.proxy === 'boolean') HW.proxy = j.proxy; if (typeof j.asr === 'boolean') HW.asr = j.asr; } catch (e) {}
+function hwSave() { try { fs.writeFileSync(hwFile(), JSON.stringify({ mode: HW.mode, proxy: HW.proxy, asr: HW.asr })); } catch (e) {} }
+function hwTry(enc) {
+  return new Promise(res => {
+    if (enc === 'h264_vaapi') return res(false);
+    const args = ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=320x240:r=30:d=0.5', ...hwArgs(enc, 2e6), '-f', 'null', '-'];
+    let done = false; const fin = ok => { if (!done) { done = true; res(ok); } };
+    try { const p = spawn(FFMPEG, args, { windowsHide: true }); p.on('error', () => fin(false)); p.on('close', c => fin(c === 0)); setTimeout(() => { try { p.kill(); } catch (e) {} fin(false); }, 8000); }
+    catch (e) { fin(false); }
+  });
+}
+function hwArgs(enc, rate) {
+  const br = String(Math.round(rate || 16e6));
+  if (enc === 'h264_nvenc') return ['-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', '21', '-b:v', '0', '-pix_fmt', 'yuv420p'];
+  if (enc === 'h264_qsv') return ['-c:v', 'h264_qsv', '-preset', 'faster', '-global_quality', '22', '-pix_fmt', 'nv12'];
+  if (enc === 'h264_amf') return ['-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cqp', '-qp_i', '20', '-qp_p', '22', '-qp_b', '24', '-pix_fmt', 'yuv420p'];
+  if (enc === 'h264_videotoolbox') return ['-c:v', 'h264_videotoolbox', '-b:v', br, '-maxrate', String(Math.round((rate || 16e6) * 1.5)), '-bufsize', String(Math.round((rate || 16e6) * 2)), '-pix_fmt', 'yuv420p'];
+  return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p'];
+}
+function hwProbe() {
+  if (HW.probed) return Promise.resolve();
+  if (!HW.probing) HW.probing = (async () => {
+    if (fs.existsSync(FFMPEG)) for (const [enc, label] of HW_CANDIDATES) if (await hwTry(enc)) { HW.enc = enc; HW.label = label; break; }
+    HW.probed = true;
+  })();
+  return HW.probing;
+}
+const hwState = () => ({ mode: HW.mode, proxy: HW.proxy, asr: HW.asr, asrOk: asrAvailable(), asrDevice: ASRN.device, enc: HW.enc, label: HW.label, probed: HW.probed });
+// storage shown in the main menu: what CapMap keeps on this computer (projects, working copies, models) and what is still free
+async function dirSize(dir) {
+  let n = 0;
+  try {
+    for (const d of await fs.promises.readdir(dir, { withFileTypes: true })) {
+      const p = path.join(dir, d.name);
+      if (d.isDirectory()) n += await dirSize(p);
+      else if (d.isFile()) { try { n += (await fs.promises.stat(p)).size; } catch (e) {} }
+    }
+  } catch (e) {}
+  return n;
+}
+ipcMain.handle('storage-info', async () => {
+  const ud = app.getPath('userData');
+  let free = 0, total = 0;
+  try { const st = fs.statfsSync(ud); free = st.bavail * st.bsize; total = st.blocks * st.bsize; } catch (e) {}
+  return { used: await dirSize(ud), free, total };
+});
+ipcMain.handle('gpu-status', () => { try { return app.getGPUFeatureStatus(); } catch (e) { return null; } });
+ipcMain.handle('hw-get', async () => { await hwProbe(); return hwState(); });
+ipcMain.handle('hw-set', async (_e, o) => {
+  if (typeof o === 'string') o = { mode: o };
+  if (o && o.mode) HW.mode = o.mode === 'off' ? 'off' : 'auto';
+  if (o && typeof o.proxy === 'boolean') HW.proxy = o.proxy;
+  if (o && typeof o.asr === 'boolean') HW.asr = o.asr;
+  hwSave(); await hwProbe(); return hwState();
+});
+app.whenReady().then(() => setTimeout(() => hwProbe().catch(() => {}), 4000));
+
+/* ---------- speech recognition on the graphics card (whisper.cpp) ---------- */
+const ASR_MODELS = {
+  tiny: { file: 'ggml-tiny-q8_0.bin', size: 43537433, sha: 'c2085835d3f50733e2ff6e4b41ae8a2b8d8110461e18821b09a15c40c42d1cca' },
+  base: { file: 'ggml-base-q8_0.bin', size: 81768585, sha: 'c577b9a86e7e048a0b7eada054f4dd79a56bbfa911fbdacf900ac5b567cbb7d9' },
+  // "Sehr genau" on the graphics card: large-v3-turbo (MIT), much more accurate than small and about as fast there
+  small: { file: 'ggml-large-v3-turbo-q5_0.bin', size: 574041195, sha: '394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2' },
+  // "Deutsch Profi": primeline/whisper-large-v3-turbo-german (Apache-2.0), ggml conversion by cstr (Apache-2.0)
+  german: { file: 'ggml-large-v3-turbo-german-q5_0.bin', size: 574041195, sha: '15e92e3db0993c52fffa781513eec9253475331c1be808f8fb409285c9d9d030', url: 'https://huggingface.co/cstr/whisper-large-v3-turbo-german-ggml/resolve/main/ggml-model-q5_0.bin' }
+};
+const ASR_URL = M => M.url || 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/' + M.file;
+const ASR_LANG = { german: 'de', english: 'en', french: 'fr', spanish: 'es', italian: 'it', turkish: 'tr', polish: 'pl', arabic: 'ar' };
+const ASRN = { proc: null, model: '', pend: new Map(), seq: 0, device: '', bad: '', dl: new Map() };
+const asrNativeDir = () => path.join(__dirname, 'native', 'whisper', process.platform + '-' + process.arch);
+const asrAvailable = () => !ASRN.bad && fs.existsSync(path.join(asrNativeDir(), 'whisper.node'));
+const asrModelDir = () => process.env.CAPMAP_ASR_MODELS || path.join(app.getPath('userData'), 'spracherkennung');
+async function asrModelFile(key, sender) {
+  if (process.env.CAPMAP_ASR_TEST_MODEL) return process.env.CAPMAP_ASR_TEST_MODEL;
+  const M = ASR_MODELS[key] || ASR_MODELS.base, dir = asrModelDir(), out = path.join(dir, M.file);
+  if (fs.existsSync(out) && fs.statSync(out).size === M.size) return out;
+  if (ASRN.dl.has(M.file)) return ASRN.dl.get(M.file);
+  const job = (async () => {
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = out + '.part', res = await net.fetch(ASR_URL(M));
+    if (!res.ok || !res.body) throw new Error('Modell-Download: HTTP ' + res.status);
+    const hash = crypto.createHash('sha256'), fh = fs.openSync(tmp, 'w'); let got = 0, last = 0;
+    try {
+      const rd = res.body.getReader();
+      for (;;) {
+        const { done, value } = await rd.read(); if (done) break;
+        fs.writeSync(fh, value); hash.update(value); got += value.length;
+        if (Date.now() - last > 200) { last = Date.now(); try { sender.send('asr-progress', { loaded: got, total: M.size }); } catch (e) {} }
+      }
+    } finally { fs.closeSync(fh); }
+    if (got !== M.size || hash.digest('hex') !== M.sha) { try { fs.unlinkSync(tmp); } catch (e) {} throw new Error('Modell-Download unvollständig'); }
+    fs.renameSync(tmp, out); try { sender.send('asr-progress', { loaded: M.size, total: M.size }); } catch (e) {}
+    return out;
+  })().finally(() => ASRN.dl.delete(M.file));
+  ASRN.dl.set(M.file, job);
+  return job;
+}
+function asrProc(model) {
+  if (ASRN.proc && ASRN.model === model) return ASRN.proc;
+  if (ASRN.proc) { try { ASRN.proc.kill(); } catch (e) {} ASRN.proc = null; }
+  // passive waiting: busy-waiting worker threads would fight with the rest of CapMap for the processor
+  const env = { ...process.env, OMP_WAIT_POLICY: 'PASSIVE', GOMP_SPINCOUNT: '0' };
+  if (process.platform === 'linux') env.LD_LIBRARY_PATH = asrNativeDir() + (env.LD_LIBRARY_PATH ? ':' + env.LD_LIBRARY_PATH : '');
+  const p = utilityProcess.fork(path.join(__dirname, 'asr-native.js'), [], { stdio: 'pipe', serviceName: 'CapMap Spracherkennung', env });
+  const sniff = d => {
+    const s = String(d);
+    const v = /ggml_vulkan: \d+ = ([^|(\n]+)/.exec(s), m = /(?:GPU name|found device):\s*([^\n]+)/.exec(s);
+    if (v) ASRN.device = v[1].trim(); else if (m && !ASRN.device) ASRN.device = m[1].trim();
+  };
+  if (p.stderr) p.stderr.on('data', sniff); if (p.stdout) p.stdout.on('data', sniff);
+  p.on('message', m => { const r = ASRN.pend.get(m.id); if (r) { ASRN.pend.delete(m.id); m.error ? r.reject(new Error(m.error)) : r.resolve(m); } });
+  p.on('exit', code => {
+    if (ASRN.proc === p) ASRN.proc = null;
+    for (const r of ASRN.pend.values()) r.reject(new Error('Spracherkennung beendet (' + code + ')'));
+    ASRN.pend.clear();
+  });
+  ASRN.proc = p; ASRN.model = model;
+  return p;
+}
+function asrSend(msg, ms = 600000) {
+  return new Promise((resolve, reject) => {
+    const id = ++ASRN.seq, p = asrProc(msg.model);
+    const t = setTimeout(() => { if (ASRN.pend.delete(id)) { reject(new Error('Zeitüberschreitung')); try { p.kill(); } catch (e) {} } }, ms);
+    ASRN.pend.set(id, { resolve: v => { clearTimeout(t); resolve(v); }, reject: e => { clearTimeout(t); reject(e); } });
+    p.postMessage({ ...msg, id });
+  });
+}
+ipcMain.handle('asr-native', async (e, { pcm, language, model }) => {
+  if (!HW.asr) throw new Error('ASR_OFF');
+  if (!asrAvailable()) throw new Error(ASRN.bad || 'nicht verfügbar');
+  const file = await asrModelFile(model, e.sender);
+  if (!ASRN.proc || ASRN.model !== file) {
+    const h = await asrSend({ cmd: 'hello', model: file }, 30000);
+    if (!h.ok) { ASRN.bad = h.error || 'Laden fehlgeschlagen'; throw new Error(ASRN.bad); }
+  }
+  const lang = language ? (ASR_LANG[language] || language) : 'auto';
+  const r = await asrSend({ cmd: 'run', model: file, pcm, language: lang });
+  return { segs: r.segs, ms: r.ms, device: ASRN.device };
+});
+
+// what is inside a file: container, video codec and pixel format, audio codec (from ffmpeg's own listing)
+function probeMedia(src) {
+  return new Promise(res => {
+    let err = '';
+    try {
+      const p = spawn(FFMPEG, ['-hide_banner', '-i', src], { windowsHide: true });
+      p.stderr.on('data', d => { err += d.toString(); if (err.length > 200000) err = err.slice(-200000); });
+      const done = () => {
+        const fmt = (/Input #0, ([^,]+(?:,[^,]+)*?), from/.exec(err) || [])[1] || '';
+        const vm = /Stream #0:\d+[^:]*: Video: (\w+)[^,]*,\s*(\w+)/.exec(err), am = /Stream #0:\d+[^:]*: Audio: (\w+)/.exec(err);
+        const fm = /Video:[^\n]*?(\d+(?:\.\d+)?) fps/.exec(err) || /Video:[^\n]*?(\d+(?:\.\d+)?) tbr/.exec(err);
+        const sm = /Duration:[^\n]*?start:\s*(-?\d+(?:\.\d+)?)/.exec(err);
+        res({ fmt: fmt.trim(), v: vm ? vm[1] : '', pix: vm ? vm[2] : '', a: am ? am[1] : '', fps: fm ? +fm[1] : 0, start: sm ? +sm[1] : 0 });
+      };
+      p.on('close', done); p.on('error', () => res({ fmt: '', v: '', pix: '', a: '' }));
+    } catch (x) { res({ fmt: '', v: '', pix: '', a: '' }); }
+  });
+}
+function runFfmpeg(e, id, src, args, out, via, preArgs = []) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(FFMPEG, ['-hide_banner', '-y', ...preArgs, '-i', src, ...args, out], { windowsHide: true });
+    let err = '', dur = 0;
+    p.stderr.on('data', d => {
+      const s = d.toString(); err = (err + s).slice(-8000);
+      if (!dur) dur = probeDuration(err);
+      const m = /time=(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(s);
+      if (m && dur) e.sender.send('convert-progress', { id, via, p: Math.min(1, ((+m[1]) * 3600 + (+m[2]) * 60 + (+m[3])) / dur) });
+    });
+    p.on('error', reject);
+    p.on('close', code => code === 0 ? resolve() : reject(new Error('ffmpeg: ' + err.split('\n').slice(-4).join(' '))));
+  });
+}
+/* ---------- smooth slow motion: RIFE (rife-ncnn-vulkan, MIT) computes the frames in between on the graphics card ---------- */
+const RIFE_DIR = () => path.join(__dirname, 'native', 'rife');
+const rifeBin = () => process.platform === 'win32' ? path.join(RIFE_DIR(), 'win32-x64', 'rife-ncnn-vulkan.exe') : process.platform === 'darwin' ? path.join(RIFE_DIR(), 'darwin', 'rife-ncnn-vulkan') : path.join(RIFE_DIR(), 'linux-x64', 'rife-ncnn-vulkan');
+ipcMain.handle('slowmo-ok', () => fs.existsSync(rifeBin()));
+const SLOWMO = new Map();
+ipcMain.handle('slowmo-cancel', (_e, id) => { const j = SLOWMO.get(id); if (j) { j.cancelled = true; try { j.proc && j.proc.kill(); } catch (x) {} } return true; });
+ipcMain.handle('slowmo', async (e, { id, path: src, seg, factor, name }) => {
+  if (!src || !fs.existsSync(src)) throw new Error('Datei nicht gefunden');
+  const bin = rifeBin(); if (!fs.existsSync(bin)) throw new Error('Zeitlupe ist in dieser Version nicht dabei');
+  try { fs.chmodSync(bin, 0o755); } catch (x) {}
+  factor = [2, 4, 8].includes(+factor) ? +factor : 4;
+  const s0 = Math.max(0, +seg.s || 0), len = Math.max(.1, (+seg.e || 0) - s0);
+  const st = fs.statSync(src), base = path.basename(name || src).replace(/\.[^.]+$/, '');
+  const key = base.replace(/[^\w\-]+/g, '_').slice(0, 50) + '_' + st.size + '_' + Math.round(st.mtimeMs) + `_slow${factor}_${Math.round(s0 * 1000)}_${Math.round(len * 1000)}`;
+  const out = path.join(CONV, key + '.mp4'), result = via => ({ url: 'capmap://local/' + encodeURIComponent(key + '.mp4'), path: out, name: base + ` (Zeitlupe ${factor}x).mp4`, via });
+  if (fs.existsSync(out) && fs.statSync(out).size > 0) return result('');
+  const job = { cancelled: false, proc: null }; SLOWMO.set(id, job);
+  const work = path.join(CONV, 'slowmo-' + crypto.randomBytes(5).toString('hex')), dIn = path.join(work, 'in'), dOut = path.join(work, 'out');
+  fs.mkdirSync(dIn, { recursive: true }); fs.mkdirSync(dOut, { recursive: true });
+  const send = (p, phase) => { try { e.sender.send('slowmo-progress', { id, p, phase }); } catch (x) {} };
+  const run = (cmd, args, onErr) => new Promise((res, rej) => {
+    if (job.cancelled) return rej(new Error('cancel'));
+    const p = spawn(cmd, args, { windowsHide: true, cwd: work }); job.proc = p; let err = '';
+    p.stderr && p.stderr.on('data', d => { err = (err + d).slice(-6000); if (onErr) onErr(String(d)); });
+    p.on('error', rej); p.on('close', c => { job.proc = null; job.cancelled ? rej(new Error('cancel')) : c === 0 ? res(err) : rej(new Error(err.split('\n').slice(-4).join(' ') || 'Fehler ' + c)); });
+  });
+  try {
+    const info = await probeMedia(src), fps = info.fps > 1 && info.fps < 241 ? info.fps : 30;
+    // 1) the frames of this part, as pictures
+    send(0, 'Bilder werden gelesen');
+    await run(FFMPEG, ['-hide_banner', '-y', '-ss', String(s0), '-t', String(len), '-i', src, '-map', '0:v:0', '-vsync', '0', '-compression_level', '1', path.join(dIn, '%08d.png')]);
+    const n = fs.readdirSync(dIn).length; if (!n) throw new Error('Keine Bilder gelesen');
+    const target = n * factor;
+    // 2) the frames in between: graphics card first, the processor if there is none
+    const watch = setInterval(() => { try { send(.05 + .8 * fs.readdirSync(dOut).length / target, 'Zwischenbilder werden berechnet'); } catch (x) {} }, 400);
+    let via = 'Grafikkarte';
+    try {
+      try { const log = await run(bin, ['-i', dIn, '-o', dOut, '-m', path.join(RIFE_DIR(), 'rife-v4.6'), '-n', String(target), '-f', '%08d.png']); if (/vkCreateInstance failed|invalid gpu|no vulkan|failed to create gpu/i.test(log)) via = 'Prozessor'; }
+      catch (x) {
+        if (x.message === 'cancel') throw x;
+        console.warn('rife gpu', x.message); via = 'Prozessor';
+        for (const f of fs.readdirSync(dOut)) fs.unlinkSync(path.join(dOut, f));
+        await run(bin, ['-i', dIn, '-o', dOut, '-m', path.join(RIFE_DIR(), 'rife-v4.6'), '-n', String(target), '-g', '-1', '-f', '%08d.png']);
+      }
+    } finally { clearInterval(watch); }
+    // 3) back into a video that plays the new frames at the old speed, so everything moves factor times slower
+    send(.87, 'Video wird geschrieben');
+    if (HW.mode === 'auto') await hwProbe();
+    const tmp = out + '.part.mp4', inArgs = ['-framerate', String(fps), '-i', path.join(dOut, '%08d.png')];
+    const enc = HW.mode === 'auto' && HW.enc ? hwArgs(HW.enc, 20e6) : null;
+    try { if (!enc) throw new Error('cpu'); await run(FFMPEG, ['-hide_banner', '-y', ...inArgs, ...enc, '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-movflags', '+faststart', tmp]); }
+    catch (x) { if (x.message === 'cancel') throw x; await run(FFMPEG, ['-hide_banner', '-y', ...inArgs, '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-movflags', '+faststart', tmp]); }
+    fs.renameSync(tmp, out); send(1, 'Fertig');
+    return result(via);
+  } finally {
+    SLOWMO.delete(id);
+    try { fs.rmSync(work, { recursive: true, force: true }); } catch (x) {}
+  }
+});
+const AUDIO_TAIL = ['-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-movflags', '+faststart'];
+const FULL_VF = ['-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2'];
+// working copy: the short side becomes 720 px (never larger than the original)
+const PROXY_VF = ['-vf', "scale='if(gte(iw,ih),-2,min(720,trunc(iw/2)*2))':'if(gte(iw,ih),min(720,trunc(ih/2)*2),-2)'"];
+ipcMain.handle('convert', async (e, { id, path: src, type, name, seg, full, sr }) => {
+  if (!src || !fs.existsSync(src)) throw new Error('Datei nicht gefunden');
+  if (!fs.existsSync(FFMPEG)) throw new Error('ffmpeg fehlt');
+  const base = path.basename(name || src).replace(/\.[^.]+$/, '');
+  const st = fs.statSync(src);
+  const isSeg = !!(seg && seg.e > seg.s), proxy = type !== 'alpha' && type !== 'pcm16' && type !== 'pcmseg' && type !== 'audio' && type !== 'image' && !isSeg && !full && HW.proxy;
+  const rate = Math.round(sr || 48000);
+  const key = base.replace(/[^\w\-]+/g, '_').slice(0, 60) + '_' + st.size + '_' + Math.round(st.mtimeMs) + (type === 'alpha' ? '_a' : type === 'pcm16' ? '_p' : type === 'pcmseg' ? `_ps${rate}_${Math.round(seg.s * 1000)}_${Math.round(seg.e * 1000)}` : isSeg ? `_s2_${Math.round(seg.s * 1000)}_${Math.round(seg.e * 1000)}` : proxy ? '_px' : '');
+  // motion graphics with transparency (ProRes 4444 and the like) become WebM with an alpha channel
+  const spec = type === 'alpha' ? { ext: 'webm', mime: 'video/webm', args: ['-map', '0:v:0', '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-b:v', '0', '-crf', '32', '-row-mt', '1', '-deadline', 'good', '-cpu-used', '4', '-auto-alt-ref', '0', '-vf', "scale='min(1080,iw)':-2", '-an'] }
+    : type === 'pcmseg' ? { ext: 'wav', mime: 'audio/wav', args: ['-map', '0:a:0', '-vn', '-ac', '2', '-ar', String(rate), '-c:a', 'pcm_s16le'] }
+    : type === 'pcm16' ? { ext: 'wav', mime: 'audio/wav', args: ['-map', '0:a:0', '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le'] }
+    : type === 'audio' ? { ext: 'mp3', mime: 'audio/mpeg', args: ['-vn', '-c:a', 'libmp3lame', '-b:a', '256k'] }
+    : type === 'image' ? { ext: 'png', mime: 'image/png', args: ['-frames:v', '1'] }
+    : { ext: 'mp4', mime: 'video/mp4', video: true };
+  const outName = key + '.' + spec.ext;
+  const out = path.join(CONV, outName);
+  const result = via => ({ url: 'capmap://local/' + encodeURIComponent(outName), name: base + '.' + spec.ext, mime: spec.mime, path: out, via: via || '', proxy, src });
+  if (fs.existsSync(out) && fs.statSync(out).size > 0) return result('');
+  const tmp = out + '.part.' + spec.ext;
+  const finish = via => { fs.renameSync(tmp, out); e.sender.send('convert-progress', { id, via, p: 1 }); return result(via); };
+  const pre = isSeg ? ['-ss', String(Math.max(0, seg.s)), '-t', String(seg.e - Math.max(0, seg.s))] : [];
+  if (!spec.video) {
+    try { await runFfmpeg(e, id, src, spec.args, tmp, '', pre); return finish(''); }
+    catch (x) { try { fs.unlinkSync(tmp); } catch (y) {} throw x; }
+  }
+  // a playable picture in the wrong wrapper (MPEG-TS, MKV, FLV … often named .mp4 by stream recorders): only repack it, takes seconds
+  if (!isSeg) {
+    const info = await probeMedia(src);
+    const vOk = /^(h264|av1|vp9|vp8)$/.test(info.v) && !/(10le|12le|422|444)/.test(info.pix), aOk = !info.a || /^(aac|mp3|opus)$/.test(info.a);
+    if (vOk && aOk && !/^mov,mp4/.test(info.fmt)) {
+      const rxOut = path.join(CONV, key.replace(/_px$/, '') + '_rx.mp4'), rxName = path.basename(rxOut);
+      const rx = { url: 'capmap://local/' + encodeURIComponent(rxName), name: base + '.mp4', mime: 'video/mp4', path: rxOut, via: 'Umpacken', proxy: false, src };
+      if (fs.existsSync(rxOut) && fs.statSync(rxOut).size > 0) return rx;
+      const rtmp = rxOut + '.part.mp4';
+      const bsf = info.a === 'aac' && /mpegts|flv|aac/.test(info.fmt) ? ['-bsf:a', 'aac_adtstoasc'] : [];
+      try {
+        await runFfmpeg(e, id, src, ['-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', ...bsf, '-movflags', '+faststart'], rtmp, 'Umpacken', ['-fflags', '+genpts']);
+        fs.renameSync(rtmp, rxOut); e.sender.send('convert-progress', { id, via: 'Umpacken', p: 1 }); return rx;
+      } catch (x) { console.warn('remux failed, converting', x.message); try { fs.unlinkSync(rtmp); } catch (y) {} }
+    }
+  }
+  // video: graphics card first (decoding and encoding), the processor if that does not work
+  if (HW.mode === 'auto') await hwProbe();
+  // a segment (for the export) only reads the part it needs; the working copy is small and fast
+  const map = isSeg ? ['-map', '0:v:0', '-an'] : ['-map', '0:v:0', '-map', '0:a:0?'];
+  let vf = proxy ? PROXY_VF : FULL_VF, tail = isSeg ? ['-movflags', '+faststart'] : AUDIO_TAIL, vpre = pre;
+  // a piece from a stream recording (MPEG-TS, FLV, MKV …): jumping straight to the start lands on the wrong spot there,
+  // the picture would only begin at the next key frame and the first second would be a still image.
+  // So: jump a few seconds earlier, keep the original times and cut exactly to the frame with a filter.
+  if (isSeg) {
+    const info = await probeMedia(src);
+    if (!/^mov,mp4/.test(info.fmt)) {
+      const st = info.start || 0, d = seg.e - Math.max(0, seg.s);
+      vpre = ['-copyts', '-ss', String(Math.max(0, seg.s - 8))];
+      vf = ['-vf', `trim=start=${(st + Math.max(0, seg.s)).toFixed(6)}:duration=${d.toFixed(6)},setpts=PTS-STARTPTS,` + vf[1]];
+      tail = ['-t', d.toFixed(6), ...tail];
+    }
+  }
+  const vrate = proxy ? 5e6 : 16e6;
+  // working copy: a key frame every half second and no B-frames, so jumping around in the editor is instant
+  const gop = proxy ? ['-g', '15', '-bf', '0'] : [];
+  if (HW.mode === 'auto' && HW.enc) {
+    try { await runFfmpeg(e, id, src, [...map, ...hwArgs(HW.enc, vrate), ...gop, ...vf, ...tail], tmp, HW.label, ['-hwaccel', 'auto', ...vpre]); return finish(HW.label); }
+    catch (x) { console.warn('hw convert failed, using the processor', x.message); try { fs.unlinkSync(tmp); } catch (y) {} }
+  }
+  const cpu = proxy ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p'] : hwArgs('libx264');
+  try { await runFfmpeg(e, id, src, [...map, ...cpu, ...gop, ...vf, ...tail], tmp, 'Prozessor', vpre); return finish('Prozessor'); }
+  catch (x) { try { fs.unlinkSync(tmp); } catch (y) {} throw x; }
+});

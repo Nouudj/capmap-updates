@@ -1,0 +1,101 @@
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+let seq = 0;
+contextBridge.exposeInMainWorld('capmapNative', {
+  platform: process.platform,
+  storage() { return ipcRenderer.invoke('storage-info'); },
+  recSources: () => ipcRenderer.invoke('rec-sources'),
+  recPick: (id, audio) => ipcRenderer.invoke('rec-pick', { id, audio }),
+  recBar: (on, opts) => ipcRenderer.invoke('rec-bar', { on, ...(opts || {}) }),
+  recState: st => ipcRenderer.send('rec-state', st),
+  recCmd: cmd => ipcRenderer.send('rec-cmd', cmd),
+  onRecCmd(cb) { const h = (_e, c) => cb(c); ipcRenderer.on('rec-cmd', h); return () => ipcRenderer.removeListener('rec-cmd', h); },
+  onRecState(cb) { const h = (_e, st) => cb(st); ipcRenderer.on('rec-state', h); return () => ipcRenderer.removeListener('rec-state', h); },
+  win(cmd) { return ipcRenderer.invoke('win', cmd); },
+  licStatus: () => ipcRenderer.invoke('lic-status'),
+  licActivate: key => ipcRenderer.invoke('lic-activate', key),
+  licDeactivate: () => ipcRenderer.invoke('lic-deactivate'),
+  licEnter: () => ipcRenderer.invoke('lic-enter'),
+  linkStatus: () => ipcRenderer.invoke('link-status'),
+  ytdlpPick: () => ipcRenderer.invoke('ytdlp-pick'),
+  linkCancel: id => ipcRenderer.invoke('link-cancel', id),
+  linkDownload(id, opts, onProgress) {
+    const h = (_e, m) => { if (m.id === id && onProgress) onProgress(m.p, m.phase); };
+    ipcRenderer.on('link-progress', h);
+    return ipcRenderer.invoke('link-download', { id, ...opts }).finally(() => ipcRenderer.removeListener('link-progress', h));
+  },
+  onWinState(cb) { ipcRenderer.on('win-state', (_e, st) => cb(st)); },
+  pathOf(file) { try { return webUtils.getPathForFile(file) || ''; } catch (e) { return ''; } },
+  convert(file, type, onProgress) {
+    const id = ++seq;
+    const path = webUtils.getPathForFile(file);
+    const h = (_e, msg) => { if (msg.id === id && onProgress) onProgress(msg.p, msg.via); };
+    ipcRenderer.on('convert-progress', h);
+    return ipcRenderer.invoke('convert', { id, path, type, name: file.name })
+      .finally(() => ipcRenderer.removeListener('convert-progress', h));
+  },
+  asr(pcm, language, model, onProgress) {
+    const h = (_e, m) => { if (onProgress) onProgress(m.loaded, m.total); };
+    ipcRenderer.on('asr-progress', h);
+    return ipcRenderer.invoke('asr-native', { pcm, language, model }).finally(() => ipcRenderer.removeListener('asr-progress', h));
+  },
+  gpuStatus: () => ipcRenderer.invoke('gpu-status'),
+  slowmoOk: () => ipcRenderer.invoke('slowmo-ok'),
+  // id comes from the page, so it can cancel with slowmoCancel(id)
+  slowmo(id, path, seg, factor, name, onProgress) {
+    const h = (_e, m) => { if (m.id === id && onProgress) onProgress(m.p, m.phase); };
+    ipcRenderer.on('slowmo-progress', h);
+    return ipcRenderer.invoke('slowmo', { id, path, seg, factor, name }).finally(() => ipcRenderer.removeListener('slowmo-progress', h));
+  },
+  slowmoCancel: id => ipcRenderer.invoke('slowmo-cancel', id),
+  hw: {
+    get: () => ipcRenderer.invoke('hw-get'),
+    set: mode => ipcRenderer.invoke('hw-set', mode)
+  },
+  listFolder(root) { return ipcRenderer.invoke('list-folder', { root }); },
+  convertPath(path, type, name, onProgress, extra) {
+    const id = ++seq;
+    const h = (_e, msg) => { if (msg.id === id && onProgress) onProgress(msg.p, msg.via); };
+    ipcRenderer.on('convert-progress', h);
+    return ipcRenderer.invoke('convert', { id, path, type, name, ...(extra || {}) }).finally(() => ipcRenderer.removeListener('convert-progress', h));
+  },
+  // the Claude connector asks the page to run an editing tool
+  onBridge(handler) {
+    ipcRenderer.on('bridge-req', async (_e, msg) => {
+      try { ipcRenderer.send('bridge-res', { id: msg.id, result: await handler(msg) }); }
+      catch (err) { ipcRenderer.send('bridge-res', { id: msg.id, error: String(err && err.message || err) }); }
+    });
+  },
+  saveVideo: async (name, blob) => ipcRenderer.invoke('save-video', { name, data: new Uint8Array(await blob.arrayBuffer()) }),
+  exp: {
+    begin: () => ipcRenderer.invoke('exp-begin'),
+    write: (id, kind, pos, data) => ipcRenderer.invoke('exp-write', { id, kind, pos, data }),
+    finish: (id, name, audio) => ipcRenderer.invoke('exp-finish', { id, name, audio }),
+    cancel: id => ipcRenderer.invoke('exp-cancel', id),
+    save: (src, name) => ipcRenderer.invoke('save-exported', { src, name }),
+    copyTo: (src, dir, name) => ipcRenderer.invoke('copy-exported', { src, dir, name })
+  },
+  pickFolder: () => ipcRenderer.invoke('pick-folder'),
+  writeVideo: async (dir, name, blob) => ipcRenderer.invoke('write-video', { dir, name, data: new Uint8Array(await blob.arrayBuffer()) }),
+  openFolder: p => ipcRenderer.invoke('open-folder', p),
+  showInFolder: p => ipcRenderer.invoke('show-in-folder', p),
+  // updates: CapMap checks for new versions by itself
+  updates: {
+    status: () => ipcRenderer.invoke('update-status'),
+    check: () => ipcRenderer.invoke('update-check'),
+    install: () => ipcRenderer.invoke('update-install'),
+    setAuto: on => ipcRenderer.invoke('update-auto', on),
+    onEvent(cb) { ipcRenderer.on('update-event', (_e, m) => cb(m)); }
+  },
+  connectClaude: () => ipcRenderer.invoke('claude-connect'),
+  claudeStatus: () => ipcRenderer.invoke('claude-status'),
+  openClaude: () => ipcRenderer.invoke('claude-open'),
+  dockClaude: on => ipcRenderer.invoke('claude-dock', on),
+  ccStatus: () => ipcRenderer.invoke('cc-status'),
+  ccLogin: () => ipcRenderer.invoke('cc-login'),
+  ccStop: () => ipcRenderer.invoke('cc-stop'),
+  ccAsk(prompt, session, onEvent) {
+    const h = (_e, m) => { if (onEvent) onEvent(m); };
+    ipcRenderer.on('cc-event', h);
+    return ipcRenderer.invoke('cc-ask', { prompt, session }).finally(() => ipcRenderer.removeListener('cc-event', h));
+  }
+});
