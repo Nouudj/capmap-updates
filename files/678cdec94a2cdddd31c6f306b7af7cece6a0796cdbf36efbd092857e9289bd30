@@ -1,0 +1,22 @@
+{
+  "name": "espeak-phonemizer",
+  "version": "0.1.2",
+  "description": "Lightweight WASM build of eSpeak-NG for g2p (grapheme to phoneme conversion), built to be used with web implementations of Piper TTS.",
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=18"
+  },
+  "types": "./espeak.d.mts",
+  "exports": {
+    ".": {
+      "types": "./espeak.d.mts",
+      "default": "./espeak.mjs"
+    },
+    "./constants": {
+      "types": "./constants.d.mts",
+      "default": "./constants.mjs"
+    },
+    "./*": "./*"
+  }
+}
