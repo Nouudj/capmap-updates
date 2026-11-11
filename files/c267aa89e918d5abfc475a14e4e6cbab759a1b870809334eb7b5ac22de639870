@@ -1,0 +1,136 @@
+// Text-to-speech worker for CapMap: Piper voices (VITS, ONNX) running locally.
+// Text -> espeak-ng phonemes (WebAssembly) -> phoneme ids -> voice model (onnxruntime-web) -> audio.
+// Voice models come once from the public rhasspy/piper-voices repository and are kept in the browser cache.
+import * as ort from './ort.webgpu.min.mjs';
+import { initialize as espeakInit, setVoice as espeakVoice, getPhonemes } from './espeak/dist/espeak.mjs';
+
+const BASE = new URL('./', self.location.href).href;
+const ASR = new URL('../asr/', self.location.href).href;
+const HF = 'https://huggingface.co/rhasspy/piper-voices/resolve/main/';
+const VOICE_CACHE = 'capmap-voices-v1';
+const ORT_CDN = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250409-89f8206ba4/dist/';
+
+// Piper's standard phoneme table (piper/phoneme_ids.py, DEFAULT_PHONEME_ID_MAP); used when a voice file has none
+const DEFAULT_MAP = (() => {
+  const chars = ["_", "^", "$", " ", "!", "'", "(", ")", ",", "-", ".", ":", ";", "?", "a", "b", "c", "d", "e", "f", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "æ", "ç", "ð", "ø", "ħ", "ŋ", "œ", "ǀ", "ǁ", "ǂ", "ǃ", "ɐ", "ɑ", "ɒ", "ɓ", "ɔ", "ɕ", "ɖ", "ɗ", "ɘ", "ə", "ɚ", "ɛ", "ɜ", "ɞ", "ɟ", "ɠ", "ɡ", "ɢ", "ɣ", "ɤ", "ɥ", "ɦ", "ɧ", "ɨ", "ɪ", "ɫ", "ɬ", "ɭ", "ɮ", "ɯ", "ɰ", "ɱ", "ɲ", "ɳ", "ɴ", "ɵ", "ɶ", "ɸ", "ɹ", "ɺ", "ɻ", "ɽ", "ɾ", "ʀ", "ʁ", "ʂ", "ʃ", "ʄ", "ʈ", "ʉ", "ʊ", "ʋ", "ʌ", "ʍ", "ʎ", "ʏ", "ʐ", "ʑ", "ʒ", "ʔ", "ʕ", "ʘ", "ʙ", "ʛ", "ʜ", "ʝ", "ʟ", "ʡ", "ʢ", "ʲ", "ˈ", "ˌ", "ː", "ˑ", "˞", "β", "θ", "χ", "ᵻ", "ⱱ", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "̧", "̃", "̪", "̯", "̩", "ʰ", "ˤ", "ε", "↓", "#", "\"", "↑", "̺", "̻", "g", "ʦ", "X", "̝", "̊", "ɝ", "ʷ", "aɪ", "aʊ", "ɔɪ", "eɪ", "oʊ"];
+  const m = {}; chars.forEach((ch, i) => { m[ch] = [i]; }); return m;
+})();
+
+let espeakReady = null, ortReady = null;
+const sessions = {};
+
+function post(type, extra){ postMessage({type, ...extra}); }
+
+async function readParts(files){
+  const bufs = [];
+  for (const f of files) { const r = await fetch(ASR + f); if (!r.ok) throw new Error('missing ' + f); bufs.push(new Uint8Array(await r.arrayBuffer())); }
+  const out = new Uint8Array(bufs.reduce((a, b) => a + b.length, 0)); let o = 0; for (const b of bufs) { out.set(b, o); o += b.length; }
+  return out;
+}
+async function initOrt(){
+  const w = ort.env.wasm; w.numThreads = 1; w.proxy = false;
+  // same runtime build as the speech recognition: reuse its local copy when it is there
+  let local = false;
+  try { const r = await fetch(ASR + 'ort-wasm-simd-threaded.jsep.mjs', {method:'HEAD'}); local = r.ok; } catch (err) {}
+  if (local) {
+    w.wasmPaths = ASR;
+    try { w.wasmBinary = (await readParts(['ort0.wasm', 'ort1.wasm'])).buffer; } catch (err) { w.wasmPaths = {mjs:ASR + 'ort-wasm-simd-threaded.jsep.mjs', wasm:ORT_CDN + 'ort-wasm-simd-threaded.jsep.wasm'}; }
+  } else w.wasmPaths = ORT_CDN;
+}
+
+async function cached(url, onProgress){
+  let cache = null;
+  try { cache = self.caches ? await caches.open(VOICE_CACHE) : null; } catch (err) {}
+  if (cache) { const hit = await cache.match(url); if (hit) return new Uint8Array(await hit.arrayBuffer()); }
+  const r = await fetch(url);
+  if (!r.ok || !r.body) throw new Error('Stimme ließ sich nicht laden (' + r.status + ')');
+  const total = +r.headers.get('content-length') || 0, reader = r.body.getReader(), chunks = []; let n = 0;
+  for (;;) { const {done, value} = await reader.read(); if (done) break; chunks.push(value); n += value.length; if (onProgress) onProgress(n, total); }
+  const out = new Uint8Array(n); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+  if (cache) { try { await cache.put(url, new Response(out)); } catch (err) {} }
+  return out;
+}
+
+async function loadVoice(v){
+  const key = v.file;
+  if (sessions[key]) return sessions[key];
+  const url = v.url || (HF + v.file);
+  let cfg;
+  if (v.config) cfg = v.config;
+  else { const j = await cached(url + '.json'); cfg = JSON.parse(new TextDecoder().decode(j)); }
+  let last = 0;
+  const bytes = await cached(url, (n, t) => { const now = Date.now(); if (now - last > 150) { last = now; post('progress', {loaded:n, total:t || v.size || n}); } });
+  if (!ortReady) ortReady = initOrt();
+  await ortReady;
+  const session = await ort.InferenceSession.create(bytes, {executionProviders:['wasm']});
+  return (sessions[key] = {session, cfg});
+}
+
+function phonemize(text, voice){
+  espeakVoice(voice);
+  const sentences = []; let cur = [];
+  for (const {phonemes, terminator, isSentenceEnd} of getPhonemes(text)) {
+    let p = phonemes.replace(/\([^)]+\)/g, '') + (terminator || '');
+    if (terminator === ',' || terminator === ':' || terminator === ';') p += ' ';
+    cur.push(...Array.from(p.normalize('NFD')));
+    if (isSentenceEnd) { sentences.push(cur); cur = []; }
+  }
+  if (cur.length) sentences.push(cur);
+  return sentences.filter(s => s.length);
+}
+function toIds(phonemes, map){
+  const ids = [...map['^'], ...map['_']];
+  for (const ph of phonemes) { const id = map[ph]; if (!id) continue; ids.push(...id, ...map['_']); }
+  ids.push(...map['$']);
+  return ids;
+}
+
+async function synth(msg){
+  const v = msg.voice, {session, cfg} = await loadVoice(v);
+  // the language data is stored as .wasm so every host serves it
+  if (!espeakReady) espeakReady = espeakInit({wasm:BASE + 'espeak/dist/wasm/espeak-ng.wasm', manifest:BASE + 'espeak/dist/data/manifest.json', data:BASE + 'espeak/dist/data/data.wasm'});
+  await espeakReady;
+  const map = cfg.phoneme_id_map || DEFAULT_MAP, inf = cfg.inference || {};
+  const rate = (cfg.audio && cfg.audio.sample_rate) || 22050;
+  const lengthScale = (inf.length_scale ?? 1) / (msg.speed || 1);
+  const scales = new Float32Array([inf.noise_scale ?? .667, lengthScale, inf.noise_w ?? .8]);
+  let sid = null;
+  if ((cfg.num_speakers || 1) > 1) {
+    const sm = cfg.speaker_id_map || {};
+    sid = v.speaker != null && sm[v.speaker] != null ? sm[v.speaker] : typeof v.speaker === 'number' ? v.speaker : 0;
+  }
+  const espeakVoiceName = (cfg.espeak && cfg.espeak.voice) || v.espeak || 'de';
+  const parts = [], gap = Math.round(rate * .18);
+  const sentences = phonemize(msg.text, espeakVoiceName);
+  for (let i = 0; i < sentences.length; i++) {
+    const ids = toIds(sentences[i], map);
+    const feeds = {
+      input:new ort.Tensor('int64', BigInt64Array.from(ids.map(BigInt)), [1, ids.length]),
+      input_lengths:new ort.Tensor('int64', BigInt64Array.from([BigInt(ids.length)]), [1]),
+      scales:new ort.Tensor('float32', scales, [3]),
+    };
+    if (sid != null && session.inputNames.includes('sid')) feeds.sid = new ort.Tensor('int64', BigInt64Array.from([BigInt(sid)]), [1]);
+    const out = await session.run(feeds);
+    const audio = out[session.outputNames[0]].data;
+    let peak = 0; for (let k = 0; k < audio.length; k++) peak = Math.max(peak, Math.abs(audio[k]));
+    const g = peak > 1e-6 ? .92 / peak : 0, a = new Float32Array(audio.length);
+    for (let k = 0; k < audio.length; k++) a[k] = audio[k] * g;
+    parts.push(a);
+    if (i < sentences.length - 1) parts.push(new Float32Array(gap));
+    post('step', {done:i + 1, total:sentences.length});
+  }
+  const pcm = new Float32Array(parts.reduce((s, p) => s + p.length, 0)); let o = 0; for (const p of parts) { pcm.set(p, o); o += p.length; }
+  return {pcm, rate};
+}
+
+self.onmessage = async e => {
+  const msg = e.data;
+  if (msg.type !== 'speak') return;
+  try {
+    const {pcm, rate} = await synth(msg);
+    postMessage({type:'done', id:msg.id, pcm, rate}, [pcm.buffer]);
+  } catch (err) {
+    postMessage({type:'error', id:msg.id, message:String(err && err.message || err)});
+  }
+};
+post('ready');

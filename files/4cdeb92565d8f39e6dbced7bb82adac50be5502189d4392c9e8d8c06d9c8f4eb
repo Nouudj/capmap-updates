@@ -1,0 +1,221 @@
+// CapMap updates itself: it asks GitHub (Releases of the CapMap repository) whether there is a newer version,
+// downloads the small update program (CapMap-Update.exe), checks its fingerprint and runs it quietly.
+// The update program closes CapMap, copies the new files and starts CapMap again.
+'use strict';
+const { app, ipcMain, net } = require('electron');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
+
+const PKG = (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')); } catch (e) { return {}; } })();
+const CFG = PKG.capmapUpdate || {};
+const VERSION = () => PKG.version || app.getVersion();
+// version of the app bundle itself (on the Mac the running code may be a newer update from the user folder)
+const BASE_VER = (() => { try { return JSON.parse(fs.readFileSync(path.join(process.env.CAPMAP_BASE_DIR || __dirname, 'package.json'), 'utf8')).version; } catch (e) { return VERSION(); } })();
+// where to look: CAPMAP_UPDATE_FEED (for tests) or GitHub's "latest release" of the repository in package.json
+// update.json in the repository: {"version":"0.6.0","notes":"…","file":"updates/CapMap-Update-0.6.0.exe","sha256":"…","size":123}
+// (a GitHub release in the same shape as the API answer works too)
+const RAW = CFG.repo ? `https://raw.githubusercontent.com/${CFG.repo}/main/` : '';
+const FEED = process.env.CAPMAP_UPDATE_FEED || (RAW ? RAW + 'update.json' : '');
+// Windows: a small update program replaces the installed files. Mac: the new app code is unpacked into the user folder
+// (boot.js starts the newest one), so the signed app bundle is never touched.
+const MAC = process.platform === 'darwin' || process.env.CAPMAP_FAKE_MAC === '1';
+const ASSET = /^CapMap-Update.*\.exe$/i;
+const EVERY = 6 * 3600 * 1000;
+
+let win = null, state = { phase: 'idle' }, timer = null;
+const settingsFile = () => path.join(app.getPath('userData'), 'updates.json');
+function settings() { try { return { auto: true, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) }; } catch (e) { return { auto: true }; } }
+function saveSettings(s) { try { fs.writeFileSync(settingsFile(), JSON.stringify(s)); } catch (e) {} }
+
+function cmpVer(a, b) {
+  const p = v => String(v || '').replace(/^v/i, '').split(/[.\-+]/).map(x => (isFinite(+x) ? +x : 0));
+  const A = p(a), B = p(b);
+  for (let i = 0; i < Math.max(A.length, B.length, 3); i++) { const d = (A[i] || 0) - (B[i] || 0); if (d) return d > 0 ? 1 : -1; }
+  return 0;
+}
+function send(extra) { state = { ...state, ...extra }; if (win && !win.isDestroyed()) win.webContents.send('update-event', publicState()); }
+function publicState() {
+  return { phase: state.phase, current: VERSION(), version: state.version || null, notes: state.notes || '', progress: state.progress || 0,
+    error: state.error || null, configured: !!FEED, auto: settings().auto, checkedAt: state.checkedAt || null, small: !!state.small, smallBytes: state.smallBytes || 0 };
+}
+
+function getJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = net.request({ url, redirect: 'follow' });
+    req.setHeader('User-Agent', 'CapMap-Updater'); req.setHeader('Accept', 'application/vnd.github+json'); req.setHeader('Cache-Control', 'no-cache');
+    let body = '';
+    req.on('response', res => {
+      res.on('data', d => { body += d; });
+      res.on('end', () => {
+        if (res.statusCode === 404) return reject(new Error('Noch keine Version veröffentlicht.'));
+        if (res.statusCode !== 200) return reject(new Error('Update-Server antwortet nicht (' + res.statusCode + ').'));
+        try { resolve(JSON.parse(body)); } catch (e) { reject(new Error('Antwort des Update-Servers unlesbar.')); }
+      });
+    });
+    req.on('error', () => reject(new Error('Keine Internetverbindung.')));
+    req.end();
+  });
+}
+
+async function check(manual) {
+  if (!FEED) { send({ phase: 'idle', error: manual ? 'Die Update-Quelle ist noch nicht eingerichtet.' : null }); return publicState(); }
+  if (state.phase === 'downloading' || state.phase === 'installing') return publicState();
+  send({ phase: 'checking', error: null });
+  try {
+    // a fresh address every time, so neither GitHub's cache nor the app's own cache hands out an old version list
+    const r = await getJson(FEED + (FEED.includes('?') ? '&' : '?') + 't=' + Date.now());
+    const version = String(r.tag_name || r.version || '').replace(/^v/i, '');
+    const base = FEED.slice(0, FEED.lastIndexOf('/') + 1);
+    const src = MAC ? (r.mac || {}) : r;
+    const asset = src.file ? { browser_download_url: /^https?:/.test(src.file) ? src.file : base + src.file, size: src.size || 0 } : MAC ? null : (r.assets || []).find(a => ASSET.test(a.name || ''));
+    const sha = src.sha256 || (MAC ? null : ((r.body || '').match(/sha256[:\s]+([0-9a-f]{64})/i) || [])[1]) || null;
+    if (MAC && src.minApp && cmpVer(src.minApp, BASE_VER) > 0) { send({ phase: 'idle', error: manual ? `Version ${version} braucht eine neue CapMap-App. Bitte die neue Mac-Version laden.` : null }); return publicState(); }
+    if (src.file && !sha) throw new Error('Das Update hat keinen Prüfwert und wird deshalb nicht installiert.');
+    state.checkedAt = Date.now();
+    state.delta = (r.delta && r.delta[MAC ? 'mac' : 'win']) || null;
+    if (version && cmpVer(version, VERSION()) > 0 && asset) {
+      state.asset = { url: asset.browser_download_url || asset.url, size: asset.size || 0, sha };
+      send({ phase: 'available', version, notes: String(r.notes || r.body || '').replace(/sha256[:\s]+[0-9a-f]{64}/ig, '').trim().slice(0, 1500) });
+    } else send({ phase: 'current', version: version || null });
+  } catch (e) { send({ phase: 'idle', error: manual ? e.message : null }); }
+  return publicState();
+}
+
+function download(url, file, size) {
+  return new Promise((resolve, reject) => {
+    const req = net.request({ url, redirect: 'follow' });
+    req.setHeader('User-Agent', 'CapMap-Updater'); req.setHeader('Accept', 'application/octet-stream');
+    req.on('response', res => {
+      if (res.statusCode !== 200) return reject(new Error('Download fehlgeschlagen (' + res.statusCode + ').'));
+      const total = +(res.headers['content-length'] || size || 0), out = fs.createWriteStream(file), hash = crypto.createHash('sha256');
+      let got = 0, last = 0;
+      res.on('data', d => { out.write(d); hash.update(d); got += d.length; const now = Date.now(); if (total && now - last > 150) { last = now; send({ progress: got / total }); } });
+      res.on('end', () => out.end(() => resolve(hash.digest('hex'))));
+      res.on('error', reject);
+    });
+    req.on('error', () => reject(new Error('Download abgebrochen – keine Internetverbindung?')));
+    req.end();
+  });
+}
+
+async function install() {
+  if (state.phase !== 'available' || !state.asset) return publicState();
+  if (state.delta && !process.env.CAPMAP_NO_DELTA) {
+    send({ phase: 'downloading', progress: 0, error: null, small: true });
+    try { await installDelta(state.delta, state.version); return publicState(); }
+    catch (e) { console.warn('small update failed, taking the full package', e && e.message); }
+  }
+  const file = path.join(os.tmpdir(), `CapMap-Update-${state.version}.${MAC ? 'zip' : 'exe'}`);
+  send({ phase: 'downloading', progress: 0, error: null, small: false });
+  try {
+    const digest = await download(state.asset.url, file, state.asset.size);
+    if (state.asset.sha && digest.toLowerCase() !== state.asset.sha.toLowerCase()) { try { fs.unlinkSync(file); } catch (e) {} throw new Error('Die heruntergeladene Datei ist beschädigt. Bitte später nochmal versuchen.'); }
+    send({ phase: 'installing', progress: 1 });
+    if (MAC) { await installMac(file, state.version); return publicState(); }
+    // the update program closes CapMap itself, copies the files and starts the new version
+    setTimeout(() => {
+      if (process.env.CAPMAP_UPDATE_DRYRUN) { send({ phase: 'done', file }); return; }
+      spawn(file, ['/S'], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+      setTimeout(() => app.quit(), 400);
+    }, 600);
+  } catch (e) { send({ phase: 'available', error: e.message || String(e) }); }
+  return publicState();
+}
+
+// Mac: unpack the new app code next to the old ones, then restart; older unpacked versions are removed
+function installMac(file, version) {
+  const root = path.join(app.getPath('userData'), 'app-updates'), dest = path.join(root, version), tmp = dest + '.part';
+  fs.mkdirSync(root, { recursive: true });
+  try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {}
+  fs.mkdirSync(tmp, { recursive: true });
+  return new Promise((resolve, reject) => {
+    const p = spawn('/usr/bin/ditto', ['-x', '-k', file, tmp]);
+    p.on('error', reject);
+    p.on('close', code => code === 0 ? resolve() : reject(new Error('Das Update ließ sich nicht entpacken (' + code + ').')));
+  }).then(() => {
+    if (!fs.existsSync(path.join(tmp, 'main.js'))) throw new Error('Das Update ist unvollständig.');
+    try { fs.rmSync(dest, { recursive: true, force: true }); } catch (e) {}
+    fs.renameSync(tmp, dest);
+    try { fs.unlinkSync(file); } catch (e) {}
+    const keep = new Set([version, path.basename(process.env.CAPMAP_CODE_DIR || '')]);
+    for (const d of fs.readdirSync(root)) if (!keep.has(d)) { try { fs.rmSync(path.join(root, d), { recursive: true, force: true }); } catch (e) {} }
+    if (process.env.CAPMAP_UPDATE_DRYRUN) { send({ phase: 'done', file: dest }); return; }
+    setTimeout(() => { app.relaunch(); app.exit(0); }, 600);
+  }).catch(e => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (x) {} send({ phase: 'available', error: e.message || String(e) }); });
+}
+
+/* ---------- small updates: only the files that changed are downloaded; unchanged ones are taken over from the running
+   version (hard link, or a copy where that is not possible). The new version is put together in the user folder and
+   boot.js starts it. If anything goes wrong, the full package is used instead. ---------- */
+function sha256File(f) {
+  return new Promise((resolve, reject) => { const h = crypto.createHash('sha256'); fs.createReadStream(f).on('data', d => h.update(d)).on('end', () => resolve(h.digest('hex'))).on('error', reject); });
+}
+function getBuf(url) {
+  return new Promise((resolve, reject) => {
+    const req = net.request({ url, redirect: 'follow' });
+    req.setHeader('User-Agent', 'CapMap-Updater'); req.setHeader('Cache-Control', 'no-cache');
+    const parts = [];
+    req.on('response', res => {
+      if (res.statusCode !== 200) { res.on('data', () => {}); res.on('end', () => reject(new Error('Download fehlgeschlagen (' + res.statusCode + ').'))); return; }
+      res.on('data', d => parts.push(d)); res.on('end', () => resolve(Buffer.concat(parts))); res.on('error', reject);
+    });
+    req.on('error', () => reject(new Error('Keine Internetverbindung.')));
+    req.end();
+  });
+}
+async function installDelta(manifestUrl, version) {
+  const man = JSON.parse((await getBuf(manifestUrl + (manifestUrl.includes('?') ? '&' : '?') + 't=' + Date.now())).toString('utf8'));
+  if (!man || !Array.isArray(man.files) || String(man.version) !== String(version)) throw new Error('Dateiliste passt nicht zur Version.');
+  const base = man.base || manifestUrl.slice(0, manifestUrl.lastIndexOf('/') + 1) + 'files/';
+  const cur = process.env.CAPMAP_CODE_DIR || __dirname;
+  // what the running version has: from its own list, or by checking the files that could match
+  let have = {}; try { for (const [p, , h] of JSON.parse(fs.readFileSync(path.join(cur, '.capmap-manifest.json'), 'utf8')).files) have[p] = h; } catch (e) { have = null; }
+  const bySha = new Map();
+  if (have) for (const [p, h] of Object.entries(have)) { if (fs.existsSync(path.join(cur, p))) bySha.set(h, path.join(cur, p)); }
+  else for (const [p, size, h] of man.files) { const f = path.join(cur, p); try { if (fs.statSync(f).size === size && await sha256File(f) === h) bySha.set(h, f); } catch (e) {} }
+  const need = man.files.filter(([, , h]) => !bySha.has(h)), total = need.reduce((a, [, s]) => a + s, 0) || 1;
+  const root = path.join(app.getPath('userData'), 'app-updates'), dest = path.join(root, version), tmp = dest + '.part';
+  fs.mkdirSync(root, { recursive: true }); try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {}
+  let got = 0;
+  try {
+    for (const [p, , h] of man.files) {
+      const out = path.join(tmp, p); fs.mkdirSync(path.dirname(out), { recursive: true });
+      const src = bySha.get(h);
+      if (src) { try { fs.linkSync(src, out); } catch (e) { fs.copyFileSync(src, out); } continue; }
+      const buf = await getBuf(base + h);
+      if (crypto.createHash('sha256').update(buf).digest('hex') !== h) throw new Error('Eine Datei kam beschädigt an.');
+      fs.writeFileSync(out, buf); bySha.set(h, out); got += buf.length; send({ progress: Math.min(.99, got / total) });
+    }
+    fs.writeFileSync(path.join(tmp, '.capmap-manifest.json'), JSON.stringify({ version: man.version, files: man.files }));
+    const pk = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf8'));
+    if (!fs.existsSync(path.join(tmp, 'main.js')) || String(pk.version) !== String(version)) throw new Error('Das Update ist unvollständig.');
+    try { fs.rmSync(dest, { recursive: true, force: true }); } catch (e) {}
+    fs.renameSync(tmp, dest);
+  } catch (e) { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (x) {} throw e; }
+  // keep the new version and the one that is running now, remove older ones
+  const keep = new Set([version, path.basename(process.env.CAPMAP_CODE_DIR || '')]);
+  for (const d of fs.readdirSync(root)) if (!keep.has(d)) { try { fs.rmSync(path.join(root, d), { recursive: true, force: true }); } catch (e) {} }
+  send({ phase: 'installing', progress: 1, smallBytes: got });
+  if (process.env.CAPMAP_UPDATE_DRYRUN) { send({ phase: 'done', file: dest, smallBytes: got }); return; }
+  setTimeout(() => { app.relaunch(); app.exit(0); }, 600);
+}
+
+function schedule() {
+  clearInterval(timer); timer = null;
+  if (!settings().auto || !FEED) return;
+  setTimeout(() => check(false), 8000);
+  timer = setInterval(() => check(false), EVERY);
+}
+
+function initUpdater(w) {
+  win = w;
+  ipcMain.handle('update-status', () => publicState());
+  ipcMain.handle('update-check', () => check(true));
+  ipcMain.handle('update-install', () => install());
+  ipcMain.handle('update-auto', (_e, on) => { const s = settings(); s.auto = !!on; saveSettings(s); schedule(); return publicState(); });
+  schedule();
+}
+module.exports = { initUpdater, cmpVer };
