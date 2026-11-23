@@ -1,0 +1,45 @@
+# Quellen der neuen Soundeffekte (für die Danksagungsseite)
+
+Alle Dateien hier stammen von **Kenney (www.kenney.nl)** und stehen unter **CC0 1.0 (Public Domain)**. Eine Nennung ist nicht Pflicht, aber erwünscht ("Sounds: Kenney, kenney.nl, CC0").
+Die Dateien wurden nur zugeschnitten (Stille am Anfang/Ende weg), auf Mono umgerechnet, im Pegel angeglichen (Spitze ca. -2,5 dB, Effektivpegel ca. -17 dB) und als MP3 (128 kbit/s) gespeichert. Mehrere kurze Originale sind zu einem Sound zusammengesetzt (siehe Spalte "Original").
+Die Dateien wurden aus öffentlichen GitHub-Spiegeln der Kenney-Pakete geholt; die Lizenz wurde jeweils in der LICENSE-Datei des Repos geprüft:
+
+- https://github.com/Calinou/kenney-interface-sounds (LICENSE.txt: "License: (Creative Commons Zero, CC0)", Interface Sounds 1.0, Kenney)
+- https://github.com/Boyquotes/kenney-impact-sounds-for-godot (LICENSE: CC0 1.0 Universal)
+- https://github.com/Boyquotes/kenney-digital-audio-for-godot (LICENSE: CC0 1.0 Universal)
+- https://github.com/ignition-bench/sound-library (LICENSE: CC0 1.0; CREDITS.md: "Sci-Fi Sounds 1.0, Kenney, CC0 1.0, https://kenney.nl/assets/sci-fi-sounds")
+
+Hinweis: Das sind Kenneys eigene Aufnahmen/Sounddesigns (teils synthetisch erzeugt), keine Fremdaufnahmen. Die Spiegel-Repos sind nicht von Kenney selbst (die Boyquotes-Repos enthalten nur den allgemeinen CC0-Text und benennen Kenney in der Repo-Beschreibung, nicht in einer Datei – Empfehlung: Herkunft einmal auf kenney.nl gegenprüfen); die Originalpakete liegen auf kenney.nl (dort aus dem Container nicht erreichbar, daher nicht gegengeprüft).
+
+| Datei | Original (Kenney-Paket, Datei) | Quelle / Lizenz |
+|---|---|---|
+| sfx/klick-weich.mp3 | click_001 | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/klick-doppel.mp3 | click_003 + click_002 (2 Klicks hintereinander) | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/pop-tief.mp3 | drop_001 | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/pop-hoch.mp3 | drop_003 | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/pop-kette.mp3 | drop_001, drop_001 (höher), drop_003 (höher), hintereinander | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/zupf-pling.mp3 | pluck_001 | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/ding-klar.mp3 | confirmation_001 | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/ding-erfolg.mp3 | confirmation_004 + dieselbe Datei höher gepitcht | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/glocken-bong.mp3 | bong_001 + eine Oktave tiefer überlagert | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/glitch-salve.mp3 | glitch_001/_003/_002/_004/_001 hintereinander | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/fehler-buzzer.mp3 | error_004, zweimal | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/fehler-ton.mp3 | error_007, tiefer gepitcht | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/kratzer.mp3 | scratch_004 + scratch_003 | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/glas-klirren.mp3 | glass_006 + glass_002 + glass_001 | Kenney "Interface Sounds" 1.0 (kenney.nl/assets/interface-sounds), Lizenz in Calinou/kenney-interface-sounds LICENSE.txt: "Creative Commons Zero, CC0" |
+| sfx/glas-bruch.mp3 | impact_glass_heavy_001 | Kenney "Impact Sounds" (kenney.nl/assets/impact-sounds), Lizenz in Boyquotes/kenney-impact-sounds-for-godot LICENSE: CC0 1.0 |
+| sfx/faust-echt.mp3 | impact_punch_heavy_002 | Kenney "Impact Sounds" (kenney.nl/assets/impact-sounds), Lizenz in Boyquotes/kenney-impact-sounds-for-godot LICENSE: CC0 1.0 |
+| sfx/glocken-einschlag.mp3 | impact_bell_heavy_000 | Kenney "Impact Sounds" (kenney.nl/assets/impact-sounds), Lizenz in Boyquotes/kenney-impact-sounds-for-godot LICENSE: CC0 1.0 |
+| sfx/metall-einschlag.mp3 | impact_metal_heavy_001 | Kenney "Impact Sounds" (kenney.nl/assets/impact-sounds), Lizenz in Boyquotes/kenney-impact-sounds-for-godot LICENSE: CC0 1.0 |
+| sfx/dumpf-bumm.mp3 | impact_soft_heavy_002 | Kenney "Impact Sounds" (kenney.nl/assets/impact-sounds), Lizenz in Boyquotes/kenney-impact-sounds-for-godot LICENSE: CC0 1.0 |
+| sfx/schritte-beton.mp3 | footstep_concrete_001/_000/_002/_003 hintereinander | Kenney "Impact Sounds" (kenney.nl/assets/impact-sounds), Lizenz in Boyquotes/kenney-impact-sounds-for-godot LICENSE: CC0 1.0 |
+| sfx/boom-tief-eins.mp3 | DSGNBoom_LowBoom01 (Originaldatei: Audio/lowFrequency_explosion_000) | Kenney "Sci-Fi Sounds" 1.0 (kenney.nl/assets/sci-fi-sounds), per CREDITS.md in ignition-bench/sound-library (CC0 1.0, Katalog nennt Originaldatei) |
+| sfx/boom-tief-zwei.mp3 | DSGNBoom_LowBoom02 | Kenney "Sci-Fi Sounds" 1.0 (kenney.nl/assets/sci-fi-sounds), per CREDITS.md in ignition-bench/sound-library (CC0 1.0, Katalog nennt Originaldatei) |
+| sfx/explosion-knall.mp3 | EXPLDsgn_CrunchBlast02 | Kenney "Sci-Fi Sounds" 1.0 (kenney.nl/assets/sci-fi-sounds), per CREDITS.md in ignition-bench/sound-library (CC0 1.0, Katalog nennt Originaldatei) |
+| sfx/laser-gross.mp3 | LASRGun_LaserLarge02 | Kenney "Sci-Fi Sounds" 1.0 (kenney.nl/assets/sci-fi-sounds), per CREDITS.md in ignition-bench/sound-library (CC0 1.0, Katalog nennt Originaldatei) |
+| sfx/laser-retro.mp3 | LASRGun_LaserRetro03 | Kenney "Sci-Fi Sounds" 1.0 (kenney.nl/assets/sci-fi-sounds), per CREDITS.md in ignition-bench/sound-library (CC0 1.0, Katalog nennt Originaldatei) |
+| sfx/energiefeld.mp3 | SCIEnrg_ForceField01 | Kenney "Sci-Fi Sounds" 1.0 (kenney.nl/assets/sci-fi-sounds), per CREDITS.md in ignition-bench/sound-library (CC0 1.0, Katalog nennt Originaldatei) |
+| sfx/powerup-hell.mp3 | power_up_3 | Kenney "Digital Audio" (kenney.nl/assets/digital-audio), Lizenz in Boyquotes/kenney-digital-audio-for-godot LICENSE: CC0 1.0 |
+| sfx/phaser-hoch.mp3 | phaser_up_2 | Kenney "Digital Audio" (kenney.nl/assets/digital-audio), Lizenz in Boyquotes/kenney-digital-audio-for-godot LICENSE: CC0 1.0 |
+
+Die 11 älteren Dateien (computer-mausklick.mp3 … wait-a-minute.mp3) sind nicht Teil dieser Liste; ihre Herkunft ist hier nicht dokumentiert.
